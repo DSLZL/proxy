@@ -1,4 +1,4 @@
-name: Proxy Speed Tester
+name: Proxy Speed Tester (Full Test)
 
 on:
   schedule:
@@ -6,14 +6,15 @@ on:
   workflow_dispatch:
 
 env:
-  SUBSCRIPTION_URL: "https:/raw.githubusercontent.com/aiboboxx/v2rayfree/main/v2"  # 替换为真实链接
-  TEST_URL: "http://www.gstatic.com/generate_204"  # 测试用低负载URL
+  SUBSCRIPTION_URL: "https://raw.githubusercontent.com/aiboboxx/v2rayfree/main/v2"
+  TEST_URL: "http://www.gstatic.com/generate_204"
   TIMEOUT: 5  # 单次测试超时(秒)
-  MAX_TEST: 20  # 最大测试数量(避免超时)
+  BLACKLIST_KEYWORDS: "CN,中国,移动,电信,联通"
 
 jobs:
   test-proxies:
     runs-on: ubuntu-latest
+    timeout-minutes: 60  # 延长超时时间
     
     steps:
     - name: Checkout code
@@ -22,7 +23,7 @@ jobs:
     - name: Install tools
       run: |
         sudo apt-get update
-        sudo apt-get install -y jq curl wget
+        sudo apt-get install -y jq curl wget netcat-openbsd
 
     - name: Download and decode subscription
       run: |
@@ -30,13 +31,16 @@ jobs:
         # 下载订阅
         curl -s "$SUBSCRIPTION_URL" -o output/subscription.raw
         # 多重解码尝试
-        base64 -d output/subscription.raw > output/decoded.txt 2>/dev/null || \
+        if ! base64 -d output/subscription.raw > output/decoded.txt 2>/dev/null; then
+          echo "检测到非Base64编码，使用原始内容"
           cp output/subscription.raw output/decoded.txt
-        # 提取vmess链接
+        fi
+        # 提取所有vmess链接
         grep -o 'vmess://[^"<> ]*' output/decoded.txt | sort -u > output/vmess.txt
-        echo "提取到 $(wc -l < output/vmess.txt) 个vmess链接"
+        TOTAL_PROXIES=$(wc -l < output/vmess.txt)
+        echo "提取到 $TOTAL_PROXIES 个vmess链接"
 
-    - name: Test proxies
+    - name: Test all proxies
       run: |
         # 过滤黑名单关键词
         BLACKLIST="${{ env.BLACKLIST_KEYWORDS }}"
@@ -50,17 +54,20 @@ jobs:
           FILTERED_PROXIES+=("$LINE")
         done < output/vmess.txt
 
-        # 测试前N个代理
+        # 测试所有代理
         echo -e "\n开始测试 ${#FILTERED_PROXIES[@]} 个代理..."
         VALID_PROXIES=()
-        for ((i=0; i<${#FILTERED_PROXIES[@]} && i<$MAX_TEST; i++)); do
+        FAILED_PROXIES=()
+        
+        for ((i=0; i<${#FILTERED_PROXIES[@]}; i++)); do
           LINK="${FILTERED_PROXIES[$i]}"
-          echo -e "\n测试代理 $((i+1)): ${LINK:0:60}..."
+          echo -e "\n测试代理 $((i+1))/${#FILTERED_PROXIES[@]}: ${LINK:0:60}..."
           
           # 解析配置
           CONFIG=$(echo "${LINK:8}" | base64 -d 2>/dev/null | jq -c 2>/dev/null)
           if [[ -z "$CONFIG" ]]; then
             echo "❌ 无效的vmess配置"
+            FAILED_PROXIES+=("$LINK|INVALID_JSON")
             continue
           fi
 
@@ -68,30 +75,41 @@ jobs:
           SERVER=$(jq -r '.add' <<< "$CONFIG")
           PORT=$(jq -r '.port' <<< "$CONFIG")
           
-          # 直接测试TCP连通性
+          # 测试TCP连通性
+          echo "测试TCP连接: $SERVER:$PORT"
           if timeout $TIMEOUT nc -z -w $TIMEOUT "$SERVER" "$PORT"; then
             # 测试HTTP延迟
             START=$(date +%s%N)
             if curl -s -m $TIMEOUT "$TEST_URL" >/dev/null; then
               LATENCY=$((($(date +%s%N) - START)/1000000))
               echo "✅ 可用 - 延迟 ${LATENCY}ms"
-              VALID_PROXIES+=("$LINK")
+              VALID_PROXIES+=("$LINK|${LATENCY}ms")
             else
               echo "❌ HTTP测试失败"
+              FAILED_PROXIES+=("$LINK|HTTP_FAIL")
             fi
           else
             echo "❌ TCP连接失败"
+            FAILED_PROXIES+=("$LINK|TCP_FAIL")
           fi
+          
+          # 避免触发速率限制
+          sleep 0.5
         done
 
         # 保存结果
+        echo -e "\n测试完成:"
+        echo "有效代理: ${#VALID_PROXIES[@]} 个"
+        echo "失败代理: ${#FAILED_PROXIES[@]} 个"
+        
         if [[ ${#VALID_PROXIES[@]} -gt 0 ]]; then
           printf "%s\n" "${VALID_PROXIES[@]}" > output/valid.txt
-          echo "有效代理: ${#VALID_PROXIES[@]} 个"
+          # 按延迟排序
+          sort -t'|' -k2 -n output/valid.txt -o output/valid_sorted.txt
         else
           echo "empty" > output/valid.txt
-          echo "⚠️ 未找到有效代理"
         fi
+        printf "%s\n" "${FAILED_PROXIES[@]}" > output/failed.txt
 
     - name: Upload results
       uses: actions/upload-artifact@v4
@@ -99,5 +117,7 @@ jobs:
         name: proxy-results
         path: |
           output/valid.txt
+          output/valid_sorted.txt
+          output/failed.txt
           output/vmess.txt
           output/decoded.txt
