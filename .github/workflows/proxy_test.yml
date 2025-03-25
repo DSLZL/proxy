@@ -9,6 +9,7 @@ env:
   SUBSCRIPTION_URL: "https://raw.githubusercontent.com/aiboboxx/v2rayfree/main/v2"  # 替换为真实订阅链接
   SPEED_TEST_URL: "http://www.gstatic.com/generate_204"
   TIMEOUT: 10
+  BLACKLIST_KEYWORDS: "CN,中国,移动,联通,电信"
 
 jobs:
   test-proxies:
@@ -22,63 +23,79 @@ jobs:
       run: |
         # 安装必要工具
         sudo apt-get update
-        sudo apt-get install -y jq curl wget
+        sudo apt-get install -y jq curl wget unzip
         
-        # 下载最新版v2ray
-        wget https://github.com/v2fly/v2ray-core/releases/latest/download/v2ray-linux-64.zip
-        unzip v2ray-linux-64.zip -d v2ray
-        chmod +x v2ray/v2ray v2ray/v2ctl
+        # 下载最新版v2ray (使用官方安装脚本)
+        sudo bash -c "$(curl -L https://raw.githubusercontent.com/v2fly/fhs-install-v2ray/master/install-release.sh)"
+        sudo systemctl stop v2ray  # 我们不使用系统服务
+        
+        # 验证安装
+        /usr/local/bin/v2ray -version
         
     - name: Run proxy tester
       run: |
+        # 创建工作目录
+        mkdir -p config output
+        
         # 下载订阅内容
         SUB_CONTENT=$(curl -s "$SUBSCRIPTION_URL")
+        echo "原始订阅内容长度: ${#SUB_CONTENT} 字符"
         
         # 解码订阅内容
         DECODED=$(echo "$SUB_CONTENT" | base64 -d)
-        echo "解码后的订阅内容:"
-        echo "$DECODED"
+        echo "解码后的订阅内容前200字符:"
+        echo "${DECODED:0:200}"
         
         # 提取vmess链接
-        VMESS_LIST=$(echo "$DECODED" | grep -o 'vmess://[^ ]*')
-        echo "找到 ${#VMESS_LIST[@]} 个vmess链接"
+        VMESS_LIST=$(echo "$DECODED" | grep -o 'vmess://[^ ]*' || true)
+        echo "找到 $(echo "$VMESS_LIST" | wc -w) 个vmess链接"
         
         # 测试每个代理
         VALID_PROXIES=()
+        INDEX=0
+        
         for VMESS in $VMESS_LIST; do
-          echo "测试代理: ${VMESS:0:50}..."
+          ((INDEX++))
+          echo -e "\n测试代理 $INDEX: ${VMESS:0:50}..."
+          
+          # 过滤黑名单关键词
+          PS=$(echo "$VMESS" | base64 -d | jq -r '.ps' || echo "")
+          for KEYWORD in ${BLACKLIST_KEYWORDS//,/ }; do
+            if [[ "$PS" == *"$KEYWORD"* ]]; then
+              echo "跳过: 包含黑名单关键词 '$KEYWORD'"
+              continue 2
+            fi
+          done
           
           # 生成临时配置文件
-          CONFIG=$(echo "{
-            \"inbounds\": [{
-              \"port\": 1080,
-              \"listen\": \"127.0.0.1\",
-              \"protocol\": \"socks\"
+          CONFIG=$(echo "$VMESS" | base64 -d | jq -c '{
+            inbounds: [{
+              port: 10808,
+              listen: "127.0.0.1",
+              protocol: "socks",
+              settings: { auth: "noauth", udp: true }
             }],
-            \"outbounds\": [{
-              \"protocol\": \"vmess\",
-              \"settings\": { \"vnext\": [{
-                \"address\": \"$(echo $VMESS | base64 -d | jq -r .add)\",
-                \"port\": $(echo $VMESS | base64 -d | jq -r .port),
-                \"users\": [{
-                  \"id\": \"$(echo $VMESS | base64 -d | jq -r .id)\",
-                  \"alterId\": $(echo $VMESS | base64 -d | jq -r .aid // 0)
-                }]
+            outbounds: [{
+              protocol: "vmess",
+              settings: { vnext: [{
+                address: .add,
+                port: .port,
+                users: [{ id: .id, alterId: (.aid // 0) }]
               }]},
-              \"streamSettings\": $(echo $VMESS | base64 -d | jq .streamSettings)
+              streamSettings: .streamSettings
             }]
-          }" | jq -c)
+          }')
           
-          echo "$CONFIG" > config.json
+          echo "$CONFIG" > config/config_$INDEX.json
           
           # 启动v2ray
-          ./v2ray/v2ray -config=config.json > /dev/null 2>&1 &
+          /usr/local/bin/v2ray -c config/config_$INDEX.json > /dev/null 2>&1 &
           V2RAY_PID=$!
           sleep 3
           
           # 测试连接
           START_TIME=$(date +%s%3N)
-          if curl -x socks5://127.0.0.1:1080 -m $TIMEOUT -s $SPEED_TEST_URL > /dev/null; then
+          if curl -x socks5://127.0.0.1:10808 -m $TIMEOUT -s $SPEED_TEST_URL > /dev/null; then
             LATENCY=$(( $(date +%s%3N) - $START_TIME ))
             echo "✅ 代理可用 - 延迟: ${LATENCY}ms"
             VALID_PROXIES+=("$VMESS")
@@ -87,14 +104,19 @@ jobs:
           fi
           
           # 停止v2ray
-          kill $V2RAY_PID
+          kill $V2RAY_PID || true
           sleep 1
         done
         
         # 保存有效代理
-        mkdir -p output
-        printf '%s\n' "${VALID_PROXIES[@]}" > output/valid_proxies.txt
-        echo "有效代理已保存到 output/valid_proxies.txt"
+        if [ ${#VALID_PROXIES[@]} -gt 0 ]; then
+          printf '%s\n' "${VALID_PROXIES[@]}" > output/valid_proxies.txt
+          echo "有效代理已保存到 output/valid_proxies.txt"
+          echo "有效代理数量: ${#VALID_PROXIES[@]}"
+        else
+          echo "⚠️ 没有找到有效代理"
+          echo "empty" > output/valid_proxies.txt
+        fi
         
     - name: Upload results
       uses: actions/upload-artifact@v4
