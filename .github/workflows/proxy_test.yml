@@ -28,78 +28,111 @@ jobs:
         
     - name: Run proxy tester
       run: |
-        set -e  # 出现错误立即退出
+        set -e
         mkdir -p config output
         
-        # 1. 下载订阅内容
+        # 1. 下载订阅
         echo "正在下载订阅内容..."
-        if ! curl -s "$SUBSCRIPTION_URL" -o subscription.raw; then
-          echo "订阅下载失败"
-          exit 1
-        fi
-        echo "下载完成，文件大小: $(wc -c < subscription.raw) 字节"
+        curl -s "$SUBSCRIPTION_URL" -o subscription.raw
+        echo "下载完成，大小: $(wc -c < subscription.raw)字节"
         
-        # 2. 多重解码尝试
+        # 2. 解码内容
         echo -e "\n正在解码订阅内容..."
-        DECODED_CONTENT=""
+        base64 -d subscription.raw > decoded.txt || {
+          echo "Base64解码失败，尝试直接使用原始内容"
+          cp subscription.raw decoded.txt
+        }
         
-        # 尝试Base64解码
-        if base64 -d subscription.raw > decoded.tmp 2>/dev/null; then
-          DECODED_CONTENT=$(cat decoded.tmp)
-          echo "使用Base64解码成功"
-        else
-          # 尝试直接使用原始内容
-          DECODED_CONTENT=$(cat subscription.raw)
-          echo "使用原始内容(非Base64编码)"
-        fi
-        
-        # 3. 提取代理链接
+        # 3. 提取链接
         echo -e "\n正在提取代理链接..."
-        VMESS_LIST=$(echo "$DECODED_CONTENT" | grep -o 'vmess://[^"<> ]*' | sort -u || true)
-        SS_LIST=$(echo "$DECODED_CONTENT" | grep -o 'ss://[^"<> ]*' | sort -u || true)
+        grep -o 'vmess://[^"<> ]*' decoded.txt | sort -u > vmess_links.txt || true
+        grep -o 'ss://[^"<> ]*' decoded.txt | sort -u > ss_links.txt || true
         
-        echo "找到 vmess 链接: $(echo "$VMESS_LIST" | wc -w) 个"
-        echo "找到 ss 链接: $(echo "$SS_LIST" | wc -w) 个"
+        echo "找到 vmess 链接: $(wc -l < vmess_links.txt) 个"
+        echo "找到 ss 链接: $(wc -l < ss_links.txt) 个"
         
-        # 4. 验证解码结果
-        if [ -z "$VMESS_LIST$SS_LIST" ]; then
-          echo "错误：未找到任何代理链接"
-          echo "解码内容前200字符:"
-          head -c 200 <<< "$DECODED_CONTENT"
-          exit 1
-        fi
-        
-        # 5. 保存解码结果
-        echo "$DECODED_CONTENT" > output/decoded.txt
-        echo -e "$VMESS_LIST\n$SS_LIST" > output/all_links.txt
-        
-        # 6. 测试代理 (示例测试前5个)
-        echo -e "\n开始测试代理(示例测试前5个)..."
+        # 4. 测试代理
+        echo -e "\n开始测试代理..."
         VALID_PROXIES=()
-        TEST_COUNT=0
+        FAILED_PROXIES=()
         
-        for LINK in $(head -n 5 <<< "$VMESS_LIST"); do
-          ((TEST_COUNT++))
-          echo -e "\n测试代理 $TEST_COUNT: ${LINK:0:60}..."
+        test_vmess() {
+          local LINK=$1
+          local INDEX=$2
           
-          # 过滤黑名单关键词
-          PS=$(echo "$LINK" | base64 -d 2>/dev/null | jq -r '.ps' || echo "")
+          echo -e "\n测试代理 $INDEX: ${LINK:0:60}..."
+          
+          # 解析配置
+          CONFIG_JSON=$(echo "${LINK:8}" | base64 -d 2>/dev/null || echo "")
+          if [ -z "$CONFIG_JSON" ]; then
+            echo "❌ 无法解码vmess链接"
+            return 1
+          fi
+          
+          PS=$(echo "$CONFIG_JSON" | jq -r '.ps' 2>/dev/null || echo "")
           for KEYWORD in ${BLACKLIST_KEYWORDS//,/ }; do
             if [[ "$PS" == *"$KEYWORD"* ]]; then
               echo "跳过: 包含黑名单关键词 '$KEYWORD'"
-              continue 2
+              return 1
             fi
           done
           
-          # 测试逻辑...
-          # [...保留原有测试代码...]
-        done
+          # 生成V2Ray配置
+          CONFIG=$(echo "$CONFIG_JSON" | jq -c '{
+            inbounds: [{
+              port: 10808,
+              listen: "127.0.0.1",
+              protocol: "socks",
+              settings: { auth: "noauth", udp: true }
+            }],
+            outbounds: [{
+              protocol: "vmess",
+              settings: { vnext: [{
+                address: .add,
+                port: .port,
+                users: [{ id: .id, alterId: (.aid // 0) }]
+              }]},
+              streamSettings: .streamSettings
+            }]
+          }')
+          
+          echo "$CONFIG" > config/config_$INDEX.json
+          
+          # 启动V2Ray
+          timeout 15 /usr/local/bin/v2ray run -c config/config_$INDEX.json > /dev/null 2>&1 &
+          V2RAY_PID=$!
+          sleep 3
+          
+          # 测试连接
+          START_TIME=$(date +%s%3N)
+          if curl -x socks5://127.0.0.1:10808 -m $TIMEOUT -s $SPEED_TEST_URL > /dev/null; then
+            LATENCY=$(( $(date +%s%3N) - $START_TIME ))
+            echo "✅ 代理可用 - 延迟: ${LATENCY}ms"
+            echo "$LINK" >> output/valid_proxies.txt
+          else
+            echo "❌ 代理不可用"
+            echo "$LINK" >> output/failed_proxies.txt
+          fi
+          
+          # 停止V2Ray
+          kill $V2RAY_PID 2>/dev/null || true
+          sleep 1
+        }
         
-        # 7. 保存结果
+        # 测试前5个vmess代理
+        INDEX=0
+        while read LINK && [ $INDEX -lt 5 ]; do
+          ((INDEX++))
+          test_vmess "$LINK" "$INDEX" || continue
+        done < vmess_links.txt
+        
+        # 汇总结果
         echo -e "\n测试完成"
-        if [ ${#VALID_PROXIES[@]} -gt 0 ]; then
-          printf '%s\n' "${VALID_PROXIES[@]}" > output/valid_proxies.txt
-          echo "找到有效代理 ${#VALID_PROXIES[@]} 个"
+        if [ -f output/valid_proxies.txt ]; then
+          VALID_COUNT=$(wc -l < output/valid_proxies.txt)
+          echo "找到有效代理: $VALID_COUNT 个"
+          echo "有效代理示例:"
+          head -n 3 output/valid_proxies.txt
         else
           echo "未找到有效代理"
           echo "empty" > output/valid_proxies.txt
@@ -111,6 +144,7 @@ jobs:
         name: proxy-results
         path: |
           output/valid_proxies.txt
-          output/decoded.txt
-          output/all_links.txt
-          subscription.raw
+          output/failed_proxies.txt
+          decoded.txt
+          vmess_links.txt
+          ss_links.txt
