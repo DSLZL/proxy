@@ -2,11 +2,11 @@ name: V2Ray Proxy Tester
 
 on:
   schedule:
-    - cron: '0 22 * * *'
+    - cron: '0 6 * * *'  # 每天早上6点运行
   workflow_dispatch:
 
 env:
-  SUBSCRIPTION_URL: "https:/raw.githubusercontent.com/aiboboxx/v2rayfree/main/v2"
+  SUBSCRIPTION_URL: "https://raw.githubusercontent.com/aiboboxx/v2rayfree/main/v2"
   SPEED_TEST_URL: "http://www.gstatic.com/generate_204"
   TIMEOUT: 10
   BLACKLIST_KEYWORDS: "CN,中国,移动,电信,联通"
@@ -95,6 +95,11 @@ jobs:
               streamSettings: .streamSettings
             }]
           }')
+          
+          if [ $? -ne 0 ]; then
+            echo "❌ JSON解析失败"
+            return 1
+          fi
           
           echo "$CONFIG" > config/config_$INDEX.json
           
