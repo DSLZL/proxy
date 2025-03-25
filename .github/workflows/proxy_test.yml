@@ -1,4 +1,4 @@
-name: V2Ray Proxy Tester (Official Decoder)
+name: Proxy Speed Tester (Full Test)
 
 on:
   schedule:
@@ -8,134 +8,120 @@ on:
 env:
   SUBSCRIPTION_URL: "https://raw.githubusercontent.com/aiboboxx/v2rayfree/main/v2"
   TEST_URL: "http://www.gstatic.com/generate_204"
-  TIMEOUT: 5
+  TIMEOUT: 5  # 单次测试超时(秒)
   BLACKLIST_KEYWORDS: "CN,中国,移动,电信,联通"
 
 jobs:
   test-proxies:
     runs-on: ubuntu-latest
-    timeout-minutes: 120  # 更长的超时时间
+    timeout-minutes: 60  # 延长超时时间
     
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
 
-    - name: Setup V2Ray
+    - name: Install tools
       run: |
         sudo apt-get update
-        sudo apt-get install -y jq curl wget
-        # 安装官方V2Ray
-        sudo bash -c "$(curl -L https://raw.githubusercontent.com/v2fly/fhs-install-v2ray/master/install-release.sh)" -- -f
-        /usr/local/bin/v2ray version
+        sudo apt-get install -y jq curl wget netcat-openbsd unzip
 
-    - name: Decode with V2Ray
+    - name: Install v2ray
+      run: |
+        # Download v2ray
+        mkdir -p v2ray
+        wget https://github.com/v2fly/v2ray-core/releases/latest/download/v2ray-linux-64.zip
+        unzip v2ray-linux-64.zip -d v2ray
+        chmod +x v2ray/v2ray
+        sudo mv v2ray/v2ray /usr/local/bin/
+        rm -rf v2ray v2ray-linux-64.zip
+
+    - name: Download and decode subscription
       run: |
         mkdir -p output
-        
-        # 1. 下载订阅
+        # 下载订阅
         curl -s "$SUBSCRIPTION_URL" -o output/subscription.raw
         
-        # 2. 使用V2Ray官方方式解码
-        /usr/local/bin/v2ray decode output/subscription.raw > output/decoded.json 2>&1 || {
-          echo "V2Ray官方解码失败，尝试备用方案"
-          base64 -d output/subscription.raw > output/decoded.txt || cp output/subscription.raw output/decoded.txt
-          # 提取所有类型链接
-          grep -Eo '(vmess|vless|trojan|ss)://[^"<> ]+' output/decoded.txt | sort -u > output/all_links.txt
-          exit 0
+        # 使用v2ray进行解码
+        cat output/subscription.raw | v2ray vmess decode > output/decoded.txt || {
+          echo "检测到非Base64编码，使用原始内容"
+          cp output/subscription.raw output/decoded.txt
         }
         
-        # 3. 从解码结果提取代理
-        if [ -f output/decoded.json ]; then
-          jq -r '.outbounds[].settings.vnext[].address // empty' output/decoded.json > output/v2ray_hosts.txt
-          echo "V2Ray官方解码成功，提取到 $(wc -l < output/v2ray_hosts.txt) 个主机"
-        fi
+        # 提取所有vmess链接
+        grep -o 'vmess://[^\"<> ]*' output/decoded.txt | sort -u > output/vmess.txt
+        TOTAL_PROXIES=$(wc -l < output/vmess.txt)
+        echo "提取到 $TOTAL_PROXIES 个vmess链接"
 
-    - name: Prepare proxies
+    - name: Test all proxies
       run: |
-        # 合并所有代理链接
-        if [ -f output/all_links.txt ]; then
-          cp output/all_links.txt output/proxies.txt
-        elif [ -f output/decoded.txt ]; then
-          grep -o 'vmess://[^"<> ]*' output/decoded.txt | sort -u > output/proxies.txt
-        else
-          echo "未找到有效代理数据"
-          exit 1
-        fi
-        
-        echo "准备测试 $(wc -l < output/proxies.txt) 个代理"
-
-    - name: Test proxies
-      run: |
-        # 安装测试工具
-        sudo apt-get install -y netcat-openbsd
-        
-        # 过滤黑名单
+        # 过滤黑名单关键词
         BLACKLIST="${{ env.BLACKLIST_KEYWORDS }}"
         FILTERED_PROXIES=()
         while read -r LINE; do
-          PS=$(echo "$LINE" | base64 -d 2>/dev/null | jq -r '.ps' || echo "")
+          PS=$(echo "$LINE" | v2ray vmess decode 2>/dev/null | jq -r '.ps' || echo "")
           if [[ "$BLACKLIST" != "" && "$PS" =~ ($BLACKLIST) ]]; then
             echo "过滤: $PS (黑名单关键词)"
             continue
           fi
           FILTERED_PROXIES+=("$LINE")
-        done < output/proxies.txt
+        done < output/vmess.txt
 
-        # 测试函数
-        test_proxy() {
-          local link=$1
-          local idx=$2
+        # 测试所有代理
+        echo -e "\n开始测试 ${#FILTERED_PROXIES[@]} 个代理..."
+        VALID_PROXIES=()
+        FAILED_PROXIES=()
+        
+        for ((i=0; i<${#FILTERED_PROXIES[@]}; i++)); do
+          LINK="${FILTERED_PROXIES[$i]}"
+          echo -e "\n测试代理 $((i+1))/${#FILTERED_PROXIES[@]}: ${LINK:0:60}..."
           
-          echo -e "\n测试代理 $idx: ${link:0:60}..."
+          # 使用v2ray解析配置
+          CONFIG=$(echo "$LINK" | v2ray vmess decode 2>/dev/null)
+          if [[ -z "$CONFIG" ]]; then
+            echo "❌ 无效的vmess配置"
+            FAILED_PROXIES+=("$LINK|INVALID_JSON")
+            continue
+          fi
+
+          # 提取连接参数
+          SERVER=$(echo "$CONFIG" | jq -r '.add')
+          PORT=$(echo "$CONFIG" | jq -r '.port')
           
-          # 解析配置
-          case "${link%%:*}" in
-            vmess)
-              json=$(echo "${link#*://}" | base64 -d | jq -c 2>/dev/null)
-              host=$(jq -r '.add' <<< "$json")
-              port=$(jq -r '.port' <<< "$json") ;;
-            *)
-              echo "❌ 暂不支持该协议"
-              return 1 ;;
-          esac
-          
-          # TCP测试
-          if timeout $TIMEOUT nc -z -w $TIMEOUT "$host" "$port"; then
-            # HTTP延迟测试
-            start=$(date +%s%N)
+          # 测试TCP连通性
+          echo "测试TCP连接: $SERVER:$PORT"
+          if timeout $TIMEOUT nc -z -w $TIMEOUT "$SERVER" "$PORT"; then
+            # 测试HTTP延迟
+            START=$(date +%s%N)
             if curl -s -m $TIMEOUT "$TEST_URL" >/dev/null; then
-              latency=$((($(date +%s%N) - start)/1000000))
-              echo "✅ 可用 - 延迟 ${latency}ms"
-              echo "$link|${latency}ms" >> output/valid.txt
+              LATENCY=$((($(date +%s%N) - START)/1000000))
+              echo "✅ 可用 - 延迟 ${LATENCY}ms"
+              VALID_PROXIES+=("$LINK|${LATENCY}ms")
             else
               echo "❌ HTTP测试失败"
-              echo "$link|HTTP_FAIL" >> output/failed.txt
+              FAILED_PROXIES+=("$LINK|HTTP_FAIL")
             fi
           else
             echo "❌ TCP连接失败"
-            echo "$link|TCP_FAIL" >> output/failed.txt
+            FAILED_PROXIES+=("$LINK|TCP_FAIL")
           fi
-        }
-
-        # 清空结果文件
-        > output/valid.txt
-        > output/failed.txt
-        
-        # 测试所有代理
-        count=0
-        for link in "${FILTERED_PROXIES[@]}"; do
-          ((count++))
-          test_proxy "$link" "$count" || continue
-          sleep 0.3  # 请求间隔
+          
+          # 避免触发速率限制
+          sleep 0.5
         done
 
-        # 结果统计
+        # 保存结果
         echo -e "\n测试完成:"
-        echo "有效代理: $(wc -l < output/valid.txt)"
-        echo "失败代理: $(wc -l < output/failed.txt)"
+        echo "有效代理: ${#VALID_PROXIES[@]} 个"
+        echo "失败代理: ${#FAILED_PROXIES[@]} 个"
         
-        # 按延迟排序
-        sort -t'|' -k2 -n output/valid.txt -o output/valid_sorted.txt
+        if [[ ${#VALID_PROXIES[@]} -gt 0 ]]; then
+          printf "%s\n" "${VALID_PROXIES[@]}" > output/valid.txt
+          # 按延迟排序
+          sort -t'|' -k2 -n output/valid.txt -o output/valid_sorted.txt
+        else
+          echo "empty" > output/valid.txt
+        fi
+        printf "%s\n" "${FAILED_PROXIES[@]}" > output/failed.txt
 
     - name: Upload results
       uses: actions/upload-artifact@v4
@@ -145,5 +131,5 @@ jobs:
           output/valid.txt
           output/valid_sorted.txt
           output/failed.txt
-          output/proxies.txt
-          output/decoded.*
+          output/vmess.txt
+          output/decoded.txt
