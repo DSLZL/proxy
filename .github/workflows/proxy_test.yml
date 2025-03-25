@@ -1,17 +1,14 @@
-name: Proxy Tester
+name: V2Ray Proxy Tester
 
 on:
   schedule:
     - cron: '0 22 * * *'  # UTC时间22:00，即北京时间6:00
   workflow_dispatch:
 
-permissions:
-  contents: read
-  actions: write
-
 env:
-  SUBSCRIPTION_URLS: "你的订阅链接"  # 替换为你的实际订阅链接
-  BLACKLIST_KEYWORDS: "CN,中国,移动,联通,电信,广电"
+  SUBSCRIPTION_URL: "https://raw.githubusercontent.com/aiboboxx/v2rayfree/main/v2"  # 替换为真实订阅链接
+  SPEED_TEST_URL: "http://www.gstatic.com/generate_204"
+  TIMEOUT: 10
 
 jobs:
   test-proxies:
@@ -21,24 +18,86 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
       
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.10'
-        
-    - name: Install dependencies
+    - name: Set up environment
       run: |
-        python -m pip install --upgrade pip
-        pip install -r src/requirements.txt
+        # 安装必要工具
+        sudo apt-get update
+        sudo apt-get install -y jq curl wget
+        
+        # 下载最新版v2ray
+        wget https://github.com/v2fly/v2ray-core/releases/latest/download/v2ray-linux-64.zip
+        unzip v2ray-linux-64.zip -d v2ray
+        chmod +x v2ray/v2ray v2ray/v2ctl
         
     - name: Run proxy tester
-      run: python src/proxy_tester.py
-      env:
-        SUBSCRIPTION_URLS: ${{ env.SUBSCRIPTION_URLS }}
-        BLACKLIST_KEYWORDS: ${{ env.BLACKLIST_KEYWORDS }}
-      
+      run: |
+        # 下载订阅内容
+        SUB_CONTENT=$(curl -s "$SUBSCRIPTION_URL")
+        
+        # 解码订阅内容
+        DECODED=$(echo "$SUB_CONTENT" | base64 -d)
+        echo "解码后的订阅内容:"
+        echo "$DECODED"
+        
+        # 提取vmess链接
+        VMESS_LIST=$(echo "$DECODED" | grep -o 'vmess://[^ ]*')
+        echo "找到 ${#VMESS_LIST[@]} 个vmess链接"
+        
+        # 测试每个代理
+        VALID_PROXIES=()
+        for VMESS in $VMESS_LIST; do
+          echo "测试代理: ${VMESS:0:50}..."
+          
+          # 生成临时配置文件
+          CONFIG=$(echo "{
+            \"inbounds\": [{
+              \"port\": 1080,
+              \"listen\": \"127.0.0.1\",
+              \"protocol\": \"socks\"
+            }],
+            \"outbounds\": [{
+              \"protocol\": \"vmess\",
+              \"settings\": { \"vnext\": [{
+                \"address\": \"$(echo $VMESS | base64 -d | jq -r .add)\",
+                \"port\": $(echo $VMESS | base64 -d | jq -r .port),
+                \"users\": [{
+                  \"id\": \"$(echo $VMESS | base64 -d | jq -r .id)\",
+                  \"alterId\": $(echo $VMESS | base64 -d | jq -r .aid // 0)
+                }]
+              }]},
+              \"streamSettings\": $(echo $VMESS | base64 -d | jq .streamSettings)
+            }]
+          }" | jq -c)
+          
+          echo "$CONFIG" > config.json
+          
+          # 启动v2ray
+          ./v2ray/v2ray -config=config.json > /dev/null 2>&1 &
+          V2RAY_PID=$!
+          sleep 3
+          
+          # 测试连接
+          START_TIME=$(date +%s%3N)
+          if curl -x socks5://127.0.0.1:1080 -m $TIMEOUT -s $SPEED_TEST_URL > /dev/null; then
+            LATENCY=$(( $(date +%s%3N) - $START_TIME ))
+            echo "✅ 代理可用 - 延迟: ${LATENCY}ms"
+            VALID_PROXIES+=("$VMESS")
+          else
+            echo "❌ 代理不可用"
+          fi
+          
+          # 停止v2ray
+          kill $V2RAY_PID
+          sleep 1
+        done
+        
+        # 保存有效代理
+        mkdir -p output
+        printf '%s\n' "${VALID_PROXIES[@]}" > output/valid_proxies.txt
+        echo "有效代理已保存到 output/valid_proxies.txt"
+        
     - name: Upload results
       uses: actions/upload-artifact@v4
       with:
-        name: filtered-proxies
-        path: output/filtered_proxies.json
+        name: valid-proxies
+        path: output/valid_proxies.txt
