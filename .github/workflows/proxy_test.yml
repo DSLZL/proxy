@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 env:
-  SUBSCRIPTION_URL: "您的订阅链接"  # 替换为真实链接
+  SUBSCRIPTION_URL: "https:/raw.githubusercontent.com/aiboboxx/v2rayfree/main/v2"  # 替换为真实链接
   TEST_URL: "http://www.gstatic.com/generate_204"  # 测试用低负载URL
   TIMEOUT: 5  # 单次测试超时(秒)
   MAX_TEST: 20  # 最大测试数量(避免超时)
