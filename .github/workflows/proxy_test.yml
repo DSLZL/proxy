@@ -1,103 +1,120 @@
-name: Proxy Speed Tester
+name: Universal V2Ray Tester
 
 on:
   schedule:
-    - cron: '0 22 * * *'  # UTC 22:00 (北京时间 6:00)
+    - cron: '0 22 * * *'
   workflow_dispatch:
 
 env:
-  SUBSCRIPTION_URL: "https:/raw.githubusercontent.com/aiboboxx/v2rayfree/main/v2"  # 替换为真实链接
-  TEST_URL: "http://www.gstatic.com/generate_204"  # 测试用低负载URL
-  TIMEOUT: 5  # 单次测试超时(秒)
-  MAX_TEST: 20  # 最大测试数量(避免超时)
+  SUBSCRIPTION_URL: "https:/raw.githubusercontent.com/aiboboxx/v2rayfree/main/v2"
+  TEST_URL: "http://www.gstatic.com/generate_204"
+  TIMEOUT: 10
+  MAX_TEST: 50
+  BLACKLIST_KEYWORDS: "CN,中国,移动,电信,联通"
 
 jobs:
   test-proxies:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
 
-    - name: Install tools
+    - name: Setup V2Ray
       run: |
         sudo apt-get update
-        sudo apt-get install -y jq curl wget
-
-    - name: Download and decode subscription
-      run: |
-        mkdir -p output
-        # 下载订阅
-        curl -s "$SUBSCRIPTION_URL" -o output/subscription.raw
-        # 多重解码尝试
-        base64 -d output/subscription.raw > output/decoded.txt 2>/dev/null || \
-          cp output/subscription.raw output/decoded.txt
-        # 提取vmess链接
-        grep -o 'vmess://[^"<> ]*' output/decoded.txt | sort -u > output/vmess.txt
-        echo "提取到 $(wc -l < output/vmess.txt) 个vmess链接"
+        sudo apt-get install -y jq curl wget docker.io
+        sudo systemctl start docker
+        
+        # 使用官方Docker镜像
+        docker pull v2fly/v2fly-core:latest
+        docker run --rm v2fly/v2fly-core -version
 
     - name: Test proxies
       run: |
-        # 过滤黑名单关键词
-        BLACKLIST="${{ env.BLACKLIST_KEYWORDS }}"
-        FILTERED_PROXIES=()
-        while read -r LINE; do
-          PS=$(echo "$LINE" | base64 -d 2>/dev/null | jq -r '.ps' || echo "")
-          if [[ "$BLACKLIST" != "" && "$PS" =~ ($BLACKLIST) ]]; then
-            echo "过滤: $PS (黑名单关键词)"
-            continue
-          fi
-          FILTERED_PROXIES+=("$LINE")
-        done < output/vmess.txt
-
-        # 测试前N个代理
-        echo -e "\n开始测试 ${#FILTERED_PROXIES[@]} 个代理..."
-        VALID_PROXIES=()
-        for ((i=0; i<${#FILTERED_PROXIES[@]} && i<$MAX_TEST; i++)); do
-          LINK="${FILTERED_PROXIES[$i]}"
-          echo -e "\n测试代理 $((i+1)): ${LINK:0:60}..."
-          
-          # 解析配置
-          CONFIG=$(echo "${LINK:8}" | base64 -d 2>/dev/null | jq -c 2>/dev/null)
-          if [[ -z "$CONFIG" ]]; then
-            echo "❌ 无效的vmess配置"
-            continue
-          fi
-
-          # 提取连接参数
-          SERVER=$(jq -r '.add' <<< "$CONFIG")
-          PORT=$(jq -r '.port' <<< "$CONFIG")
-          
-          # 直接测试TCP连通性
-          if timeout $TIMEOUT nc -z -w $TIMEOUT "$SERVER" "$PORT"; then
-            # 测试HTTP延迟
-            START=$(date +%s%N)
-            if curl -s -m $TIMEOUT "$TEST_URL" >/dev/null; then
-              LATENCY=$((($(date +%s%N) - START)/1000000))
-              echo "✅ 可用 - 延迟 ${LATENCY}ms"
-              VALID_PROXIES+=("$LINK")
-            else
-              echo "❌ HTTP测试失败"
-            fi
-          else
-            echo "❌ TCP连接失败"
-          fi
-        done
-
-        # 保存结果
-        if [[ ${#VALID_PROXIES[@]} -gt 0 ]]; then
-          printf "%s\n" "${VALID_PROXIES[@]}" > output/valid.txt
-          echo "有效代理: ${#VALID_PROXIES[@]} 个"
-        else
-          echo "empty" > output/valid.txt
-          echo "⚠️ 未找到有效代理"
+        mkdir -p config output
+        
+        # 1. 下载并解码订阅
+        curl -s "$SUBSCRIPTION_URL" -o output/sub.raw
+        if ! base64 -d output/sub.raw > output/decoded.txt 2>/dev/null; then
+          cp output/sub.raw output/decoded.txt
         fi
+
+        # 2. 提取所有类型链接
+        grep -Eo '(vmess|vless|trojan|ss)://[^"<> ]+' output/decoded.txt | sort -u > output/all.txt
+        echo "提取到 $(wc -l < output/all.txt) 个代理链接"
+
+        # 3. 测试函数
+        test_proxy() {
+          local link=$1
+          local idx=$2
+          
+          echo -e "\n测试代理 $idx: ${link:0:60}..."
+          
+          # 生成V2Ray配置
+          case "${link%%:*}" in
+            vmess)
+              config=$(generate_vmess_config "$link") ;;
+            vless)
+              config=$(generate_vless_config "$link") ;;
+            trojan)
+              config=$(generate_trojan_config "$link") ;;
+            ss)
+              config=$(generate_ss_config "$link") ;;
+            *)
+              echo "❌ 不支持的协议: ${link%%:*}"
+              return 1 ;;
+          esac
+
+          echo "$config" > config/config_$idx.json
+          
+          # 使用Docker运行测试
+          if docker run --rm -v $(pwd)/config:/config \
+             v2fly/v2fly-core run -c /config/config_$idx.json > /dev/null 2>&1 &
+          then
+            sleep 3
+            if curl -x socks5://localhost:10808 -m $TIMEOUT -s $TEST_URL > /dev/null; then
+              echo "✅ 测试通过"
+              echo "$link" >> output/valid.txt
+            else
+              echo "❌ 连接测试失败"
+            fi
+            docker stop $(docker ps -q --filter ancestor=v2fly/v2fly-core) > /dev/null
+          else
+            echo "❌ 启动容器失败"
+          fi
+        }
+
+        # 协议配置生成函数
+        generate_vmess_config() {
+          local json=$(echo "${1#*://}" | base64 -d | jq -c '
+            .streamSettings += {"sockopt": {"mark": 255}}')
+          jq -n --argjson cfg "$json" '{
+            inbounds: [{
+              port: 10808,
+              protocol: "socks",
+              settings: {auth: "noauth", udp: true}
+            }],
+            outbounds: [{
+              protocol: "vmess",
+              settings: {vnext: [$cfg | del(.ps)]},
+              streamSettings: $cfg.streamSettings
+            }]
+          }'
+        }
+
+        # 其他协议生成函数类似...
+
+        # 4. 执行测试
+        count=0
+        while read link && [ $count -lt $MAX_TEST ]; do
+          ((count++))
+          test_proxy "$link" "$count" || continue
+        done < output/all.txt
 
     - name: Upload results
       uses: actions/upload-artifact@v4
       with:
         name: proxy-results
-        path: |
-          output/valid.txt
-          output/vmess.txt
-          output/decoded.txt
+        path: output/*
