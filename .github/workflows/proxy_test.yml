@@ -1,123 +1,90 @@
-name: Proxy Speed Tester (Full Test)
+name: Full Proxy Parser
 
 on:
-  schedule:
-    - cron: '0 22 * * *'  # UTC 22:00 (北京时间 6:00)
   workflow_dispatch:
 
 env:
   SUBSCRIPTION_URL: "https://raw.githubusercontent.com/aiboboxx/v2rayfree/main/v2"
-  TEST_URL: "http://www.gstatic.com/generate_204"
-  TIMEOUT: 5  # 单次测试超时(秒)
-  BLACKLIST_KEYWORDS: "CN,中国,移动,电信,联通"
 
 jobs:
-  test-proxies:
+  full-parse:
     runs-on: ubuntu-latest
-    timeout-minutes: 60  # 延长超时时间
-    
     steps:
-    - name: Checkout code
+    - name: Checkout
       uses: actions/checkout@v4
 
     - name: Install tools
       run: |
         sudo apt-get update
-        sudo apt-get install -y jq curl wget netcat-openbsd
+        sudo apt-get install -y jq python3-pip
+        pip install beautifulsoup4
 
-    - name: Download and decode subscription
+    - name: Decode and parse
       run: |
         mkdir -p output
-        # 下载订阅
-        curl -s "$SUBSCRIPTION_URL" -o output/subscription.raw
-        # 多重解码尝试
-        if ! base64 -d output/subscription.raw > output/decoded.txt 2>/dev/null; then
-          echo "检测到非Base64编码，使用原始内容"
-          cp output/subscription.raw output/decoded.txt
-        fi
-        # 提取所有vmess链接
-        grep -o 'vmess://[^"<> ]*' output/decoded.txt | sort -u > output/vmess.txt
-        TOTAL_PROXIES=$(wc -l < output/vmess.txt)
-        echo "提取到 $TOTAL_PROXIES 个vmess链接"
-
-    - name: Test all proxies
-      run: |
-        # 过滤黑名单关键词
-        BLACKLIST="${{ env.BLACKLIST_KEYWORDS }}"
-        FILTERED_PROXIES=()
-        while read -r LINE; do
-          PS=$(echo "$LINE" | base64 -d 2>/dev/null | jq -r '.ps' || echo "")
-          if [[ "$BLACKLIST" != "" && "$PS" =~ ($BLACKLIST) ]]; then
-            echo "过滤: $PS (黑名单关键词)"
-            continue
-          fi
-          FILTERED_PROXIES+=("$LINE")
-        done < output/vmess.txt
-
-        # 测试所有代理
-        echo -e "\n开始测试 ${#FILTERED_PROXIES[@]} 个代理..."
-        VALID_PROXIES=()
-        FAILED_PROXIES=()
         
-        for ((i=0; i<${#FILTERED_PROXIES[@]}; i++)); do
-          LINK="${FILTERED_PROXIES[$i]}"
-          echo -e "\n测试代理 $((i+1))/${#FILTERED_PROXIES[@]}: ${LINK:0:60}..."
-          
-          # 解析配置
-          CONFIG=$(echo "${LINK:8}" | base64 -d 2>/dev/null | jq -c 2>/dev/null)
-          if [[ -z "$CONFIG" ]]; then
-            echo "❌ 无效的vmess配置"
-            FAILED_PROXIES+=("$LINK|INVALID_JSON")
-            continue
-          fi
-
-          # 提取连接参数
-          SERVER=$(jq -r '.add' <<< "$CONFIG")
-          PORT=$(jq -r '.port' <<< "$CONFIG")
-          
-          # 测试TCP连通性
-          echo "测试TCP连接: $SERVER:$PORT"
-          if timeout $TIMEOUT nc -z -w $TIMEOUT "$SERVER" "$PORT"; then
-            # 测试HTTP延迟
-            START=$(date +%s%N)
-            if curl -s -m $TIMEOUT "$TEST_URL" >/dev/null; then
-              LATENCY=$((($(date +%s%N) - START)/1000000))
-              echo "✅ 可用 - 延迟 ${LATENCY}ms"
-              VALID_PROXIES+=("$LINK|${LATENCY}ms")
-            else
-              echo "❌ HTTP测试失败"
-              FAILED_PROXIES+=("$LINK|HTTP_FAIL")
-            fi
-          else
-            echo "❌ TCP连接失败"
-            FAILED_PROXIES+=("$LINK|TCP_FAIL")
-          fi
-          
-          # 避免触发速率限制
-          sleep 0.5
-        done
-
-        # 保存结果
-        echo -e "\n测试完成:"
-        echo "有效代理: ${#VALID_PROXIES[@]} 个"
-        echo "失败代理: ${#FAILED_PROXIES[@]} 个"
+        # 1. 下载原始内容
+        curl -s "$SUBSCRIPTION_URL" -o output/original.txt
         
-        if [[ ${#VALID_PROXIES[@]} -gt 0 ]]; then
-          printf "%s\n" "${VALID_PROXIES[@]}" > output/valid.txt
-          # 按延迟排序
-          sort -t'|' -k2 -n output/valid.txt -o output/valid_sorted.txt
-        else
-          echo "empty" > output/valid.txt
+        # 2. 多重解码尝试
+        decode_failed=false
+        base64 -d output/original.txt > output/decoded.txt 2>/dev/null || decode_failed=true
+        
+        if $decode_failed; then
+          echo "尝试Base64解码失败，使用原始内容"
+          cp output/original.txt output/decoded.txt
         fi
-        printf "%s\n" "${FAILED_PROXIES[@]}" > output/failed.txt
+
+        # 3. 使用Python全面解析
+        cat << 'EOF' > parse_proxies.py
+        import re
+        import json
+        from bs4 import BeautifulSoup
+
+        with open('output/decoded.txt', 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+
+        # 尝试解析HTML格式
+        soup = BeautifulSoup(content, 'html.parser')
+        text_content = soup.get_text() if soup.find() else content
+
+        # 匹配所有可能格式的vmess链接
+        vmess_links = re.findall(
+            r'(vmess://[A-Za-z0-9_-]+(?:=[A-Za-z0-9_-]*)?(?:/[A-Za-z0-9_-]*)?(?:\?[A-Za-z0-9_-]+(?:=[A-Za-z0-9_-]*)?(?:&[A-Za-z0-9_-]+(?:=[A-Za-z0-9_-]*)?)*)',
+            text_content,
+            re.MULTILINE
+        )
+
+        # 去重并验证JSON格式
+        valid_links = []
+        seen = set()
+        for link in vmess_links:
+            if link not in seen:
+                try:
+                    json_str = base64.b64decode(link[8:] + '==').decode('utf-8')
+                    json.loads(json_str)  # 验证是否为有效JSON
+                    valid_links.append(link)
+                    seen.add(link)
+                except:
+                    continue
+
+        with open('output/vmess_all.txt', 'w') as f:
+            f.write('\n'.join(valid_links))
+        EOF
+
+        python3 parse_proxies.py
+        
+        # 4. 统计结果
+        echo "解析结果："
+        wc -l output/vmess_all.txt
+        echo "前10个代理示例："
+        head -n 10 output/vmess_all.txt
 
     - name: Upload results
       uses: actions/upload-artifact@v4
       with:
-        name: proxy-results
+        name: parsing-results
         path: |
-          output/valid.txt
-          output/valid_sorted.txt
-          output/failed.txt
-          output/vmess.txt
+          output/original.txt
           output/decoded.txt
+          output/vmess_all.txt
