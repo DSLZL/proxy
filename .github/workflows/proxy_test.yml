@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 env:
-  SUBSCRIPTION_URL: "您的订阅链接"
+  SUBSCRIPTION_URL: "https:/raw.githubusercontent.com/aiboboxx/v2rayfree/main/v2"
   SPEED_TEST_URL: "http://www.gstatic.com/generate_204"
   TIMEOUT: 10
   BLACKLIST_KEYWORDS: "CN,中国,移动,联通,电信"
