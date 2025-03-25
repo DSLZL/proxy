@@ -34,7 +34,7 @@ jobs:
         BLACKLIST_KEYWORDS: ${{ env.BLACKLIST_KEYWORDS }}
       
     - name: Upload results
-      uses: actions/upload-artifact@v2
+      uses: actions/upload-artifact@v4
       with:
         name: filtered-proxies
         path: output/filtered_proxies.json
