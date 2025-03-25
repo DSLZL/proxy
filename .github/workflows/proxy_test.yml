@@ -6,10 +6,10 @@ on:
   workflow_dispatch:
 
 env:
-  SUBSCRIPTION_URL: "https:/raw.githubusercontent.com/aiboboxx/v2rayfree/main/v2"
+  SUBSCRIPTION_URL: "您的订阅链接"
   SPEED_TEST_URL: "http://www.gstatic.com/generate_204"
   TIMEOUT: 10
-  BLACKLIST_KEYWORDS: "CN,中国,移动,联通,电信"
+  BLACKLIST_KEYWORDS: "CN,中国,移动,电信,联通"
 
 jobs:
   test-proxies:
@@ -28,48 +28,80 @@ jobs:
         
     - name: Run proxy tester
       run: |
+        set -e  # 出现错误立即退出
         mkdir -p config output
         
-        # 下载并完整显示订阅内容(保存到文件)
-        curl -s "$SUBSCRIPTION_URL" > subscription.txt
-        echo "完整订阅内容已保存到 subscription.txt"
-        echo "文件大小: $(wc -c < subscription.txt) 字节"
+        # 1. 下载订阅内容
+        echo "正在下载订阅内容..."
+        if ! curl -s "$SUBSCRIPTION_URL" -o subscription.raw; then
+          echo "订阅下载失败"
+          exit 1
+        fi
+        echo "下载完成，文件大小: $(wc -c < subscription.raw) 字节"
         
-        # 改进的解码方式
-        DECODED=$(base64 -d subscription.txt 2>/dev/null || cat subscription.txt)
-        echo "解码后的订阅内容:"
-        echo "$DECODED"
-        echo "$DECODED" > decoded.txt
+        # 2. 多重解码尝试
+        echo -e "\n正在解码订阅内容..."
+        DECODED_CONTENT=""
         
-        # 改进的链接提取
-        VMESS_LIST=$(grep -o 'vmess://[^ ]*' decoded.txt || true)
-        SS_LIST=$(grep -o 'ss://[^ ]*' decoded.txt || true)
+        # 尝试Base64解码
+        if base64 -d subscription.raw > decoded.tmp 2>/dev/null; then
+          DECODED_CONTENT=$(cat decoded.tmp)
+          echo "使用Base64解码成功"
+        else
+          # 尝试直接使用原始内容
+          DECODED_CONTENT=$(cat subscription.raw)
+          echo "使用原始内容(非Base64编码)"
+        fi
+        
+        # 3. 提取代理链接
+        echo -e "\n正在提取代理链接..."
+        VMESS_LIST=$(echo "$DECODED_CONTENT" | grep -o 'vmess://[^"<> ]*' | sort -u || true)
+        SS_LIST=$(echo "$DECODED_CONTENT" | grep -o 'ss://[^"<> ]*' | sort -u || true)
         
         echo "找到 vmess 链接: $(echo "$VMESS_LIST" | wc -w) 个"
         echo "找到 ss 链接: $(echo "$SS_LIST" | wc -w) 个"
         
-        # 合并所有代理链接
-        ALL_LINKS=$(echo -e "$VMESS_LIST\n$SS_LIST")
-        echo "总共找到代理链接: $(echo "$ALL_LINKS" | wc -l) 个"
+        # 4. 验证解码结果
+        if [ -z "$VMESS_LIST$SS_LIST" ]; then
+          echo "错误：未找到任何代理链接"
+          echo "解码内容前200字符:"
+          head -c 200 <<< "$DECODED_CONTENT"
+          exit 1
+        fi
         
-        # 测试逻辑(同前)
+        # 5. 保存解码结果
+        echo "$DECODED_CONTENT" > output/decoded.txt
+        echo -e "$VMESS_LIST\n$SS_LIST" > output/all_links.txt
+        
+        # 6. 测试代理 (示例测试前5个)
+        echo -e "\n开始测试代理(示例测试前5个)..."
         VALID_PROXIES=()
-        INDEX=0
+        TEST_COUNT=0
         
-        for LINK in $ALL_LINKS; do
-          ((INDEX++))
-          echo -e "\n测试代理 $INDEX: ${LINK:0:100}..."
+        for LINK in $(head -n 5 <<< "$VMESS_LIST"); do
+          ((TEST_COUNT++))
+          echo -e "\n测试代理 $TEST_COUNT: ${LINK:0:60}..."
           
-          # 过滤和测试逻辑保持不变...
-          # [...原有测试代码...]
+          # 过滤黑名单关键词
+          PS=$(echo "$LINK" | base64 -d 2>/dev/null | jq -r '.ps' || echo "")
+          for KEYWORD in ${BLACKLIST_KEYWORDS//,/ }; do
+            if [[ "$PS" == *"$KEYWORD"* ]]; then
+              echo "跳过: 包含黑名单关键词 '$KEYWORD'"
+              continue 2
+            fi
+          done
+          
+          # 测试逻辑...
+          # [...保留原有测试代码...]
         done
         
-        # 保存结果
+        # 7. 保存结果
+        echo -e "\n测试完成"
         if [ ${#VALID_PROXIES[@]} -gt 0 ]; then
           printf '%s\n' "${VALID_PROXIES[@]}" > output/valid_proxies.txt
-          echo "有效代理示例:"
-          head -n 3 output/valid_proxies.txt
+          echo "找到有效代理 ${#VALID_PROXIES[@]} 个"
         else
+          echo "未找到有效代理"
           echo "empty" > output/valid_proxies.txt
         fi
         
@@ -79,5 +111,6 @@ jobs:
         name: proxy-results
         path: |
           output/valid_proxies.txt
-          decoded.txt
-          subscription.txt
+          output/decoded.txt
+          output/all_links.txt
+          subscription.raw
