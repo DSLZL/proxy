@@ -1,0 +1,40 @@
+name: Proxy Tester
+
+on:
+  schedule:
+    - cron: '0 22 * * *'  # UTC时间22:00，即北京时间6:00
+  workflow_dispatch:  # 允许手动触发
+
+env:
+  SUBSCRIPTION_URLS: "https://raw.githubusercontent.com/aiboboxx/v2rayfree/main/v2"  # 多个订阅链接用逗号分隔
+  BLACKLIST_KEYWORDS: "CN,中国,移动,联通,电信"  # 可选，覆盖默认黑名单关键词
+
+jobs:
+  test-proxies:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v2
+      
+    - name: Set up Python
+      uses: actions/setup-python@v2
+      with:
+        python-version: '3.9'
+        
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r src/requirements.txt
+        
+    - name: Run proxy tester
+      run: python src/proxy_tester.py
+      env:
+        SUBSCRIPTION_URLS: ${{ env.SUBSCRIPTION_URLS }}
+        BLACKLIST_KEYWORDS: ${{ env.BLACKLIST_KEYWORDS }}
+      
+    - name: Upload results
+      uses: actions/upload-artifact@v2
+      with:
+        name: filtered-proxies
+        path: output/filtered_proxies.json
