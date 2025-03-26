@@ -15,10 +15,17 @@ jobs:
     - name: Setup environment
       run: |
         sudo apt-get update
-        sudo apt-get install -y wget jq bc unzip
+        sudo apt-get install -y wget jq bc unzip python3 python3-pip
+        pip install speedtest-cli
+        
+        # 下载最新版 v2ray-core
         wget https://github.com/v2fly/v2ray-core/releases/latest/download/v2ray-linux-64.zip
         unzip v2ray-linux-64.zip
         chmod +x v2ray
+        
+        # 安装 yq 用于处理可能不规范的 JSON
+        sudo wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O /usr/bin/yq
+        sudo chmod +x /usr/bin/yq
 
     - name: Process subscription
       run: |
@@ -35,31 +42,53 @@ jobs:
           echo "$SUB_CONTENT" > subscription.txt
         fi
 
-        # 检测订阅类型并转换格式
-        if grep -qE '^vmess://|^ss://|^trojan://' subscription.txt; then
-          # 处理标准分享链接格式
-          echo '{"outbounds": []}' > v2ray-config.json
+        # 创建空的v2ray配置
+        echo '{"outbounds": []}' > v2ray-config.json
+        
+        # 处理vmess链接
+        grep -E '^vmess://' subscription.txt | while read -r line; do
+          vmess_encoded="${line#vmess://}"
+          # 添加必要的base64填充（如果缺失）
+          padding=$((4 - (${#vmess_encoded} % 4)))
+          if [ $padding -ne 4 ]; then
+            vmess_encoded="${vmess_encoded}===="
+            vmess_encoded="${vmess_encoded:0:$(( ${#vmess_encoded} - $padding ))}"
+          fi
           
-          # 处理vmess链接
-          grep -E '^vmess://' subscription.txt | while read line; do
-            vmess_json=$(echo "${line#vmess://}" | base64 -d 2>/dev/null || echo "")
-            [ -n "$vmess_json" ] && jq --argjson vmess "$vmess_json" '.outbounds += [{
-              "protocol": "vmess",
-              "settings": {"vnext": [$vmess]},
-              "streamSettings": $vmess.streamSettings
-            }]' v2ray-config.json > tmp.json && mv tmp.json v2ray-config.json
-          done
+          if vmess_json=$(echo "$vmess_encoded" | base64 -d 2>/dev/null); then
+            # 使用yq处理可能不规范的JSON
+            echo "$vmess_json" | yq -o json > vmess-temp.json
+            jq --slurpfile vmess vmess-temp.json '
+              .outbounds += [{
+                "protocol": "vmess",
+                "settings": {"vnext": [$vmess[0]]},
+                "streamSettings": $vmess[0].streamSettings
+              }]' v2ray-config.json > tmp.json && mv tmp.json v2ray-config.json
+          fi
+        done
+        
+        # 处理ss链接
+        grep -E '^ss://' subscription.txt | while read -r line; do
+          ss_encoded="${line#ss://}"
+          ss_encoded="${ss_encoded%%#*}"
           
-          # 处理ss链接（简化版）
-          grep -E '^ss://' subscription.txt | while read line; do
-            ss_config=$(echo "${line#ss://}" | cut -d'#' -f1)
-            decoded_ss=$(echo "$ss_config" | base64 -d 2>/dev/null || echo "")
-            IFS=':' read -r method password_hostport <<< "$decoded_ss"
-            IFS='@' read -r password hostport <<< "$password_hostport"
-            IFS=':' read -r host port <<< "$hostport"
+          # 添加必要的base64填充
+          padding=$((4 - (${#ss_encoded} % 4)))
+          if [ $padding -ne 4 ]; then
+            ss_encoded="${ss_encoded}===="
+            ss_encoded="${ss_encoded:0:$(( ${#ss_encoded} - $padding ))}"
+          fi
+          
+          if ss_decoded=$(echo "$ss_encoded" | base64 -d 2>/dev/null); then
+            method=$(echo "$ss_decoded" | cut -d':' -f1)
+            password_hostport=$(echo "$ss_decoded" | cut -d':' -f2-)
+            password=$(echo "$password_hostport" | cut -d'@' -f1)
+            hostport=$(echo "$password_hostport" | cut -d'@' -f2)
+            host=$(echo "$hostport" | cut -d':' -f1)
+            port=$(echo "$hostport" | cut -d':' -f2)
             
-            jq --arg host "$host" --arg port "$port" --arg method "$method" --arg password "$password" \
-              '.outbounds += [{
+            jq --arg host "$host" --arg port "$port" --arg method "$method" --arg password "$password" '
+              .outbounds += [{
                 "protocol": "shadowsocks",
                 "settings": {
                   "servers": [{
@@ -70,31 +99,40 @@ jobs:
                   }]
                 }
               }]' v2ray-config.json > tmp.json && mv tmp.json v2ray-config.json
-          done
+          fi
+        done
+        
+        # 处理trojan链接
+        grep -E '^trojan://' subscription.txt | while read -r line; do
+          trojan_config="${line#trojan://}"
+          password=$(echo "$trojan_config" | cut -d'@' -f1)
+          hostport=$(echo "$trojan_config" | cut -d'@' -f2 | cut -d'#' -f1)
+          host=$(echo "$hostport" | cut -d':' -f1)
+          port=$(echo "$hostport" | cut -d':' -f2)
           
-          # 处理trojan链接（简化版）
-          grep -E '^trojan://' subscription.txt | while read line; do
-            trojan_config="${line#trojan://}"
-            password=$(echo "$trojan_config" | cut -d'@' -f1)
-            hostport=$(echo "$trojan_config" | cut -d'@' -f2 | cut -d'#' -f1)
-            host=$(echo "$hostport" | cut -d':' -f1)
-            port=$(echo "$hostport" | cut -d':' -f2)
-            
-            jq --arg host "$host" --arg port "$port" --arg password "$password" \
-              '.outbounds += [{
-                "protocol": "trojan",
-                "settings": {
-                  "servers": [{
-                    "address": $host,
-                    "port": $port|tonumber,
-                    "password": $password
-                  }]
-                }
-              }]' v2ray-config.json > tmp.json && mv tmp.json v2ray-config.json
-          done
-        else
-          # 处理JSON格式配置
-          jq '.' subscription.txt > v2ray-config.json
+          jq --arg host "$host" --arg port "$port" --arg password "$password" '
+            .outbounds += [{
+              "protocol": "trojan",
+              "settings": {
+                "servers": [{
+                  "address": $host,
+                  "port": $port|tonumber,
+                  "password": $password
+                }]
+              }
+            }]' v2ray-config.json > tmp.json && mv tmp.json v2ray-config.json
+        done
+        
+        # 处理原始JSON配置
+        if jq empty subscription.txt 2>/dev/null; then
+          jq '.outbounds' subscription.txt > outbounds.json
+          jq --slurpfile ob outbounds.json '.outbounds = $ob[0]' v2ray-config.json > tmp.json && mv tmp.json v2ray-config.json
+        fi
+        
+        # 验证最终配置
+        if ! jq empty v2ray-config.json 2>/dev/null; then
+          echo "生成的配置文件无效，请检查订阅格式"
+          exit 1
         fi
 
     - name: Test proxies
@@ -106,19 +144,19 @@ jobs:
         CONFIG_FILE="$1"
         RESULTS_FILE="$2"
         
-        # 随机分配本地端口
+        # 生成随机本地端口
         LOCAL_PORT=$((10800 + RANDOM % 1000))
         
-        # 修改配置使用随机端口
-        jq --argjson port "$LOCAL_PORT" '(.. | .port? | select(. != null)) |= $port' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp"
-        mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+        # 创建临时配置文件
+        TEMP_CONFIG="/tmp/v2ray-config-$(date +%s).json"
+        jq --argjson port "$LOCAL_PORT" '(.. | .port? | select(. != null)) |= $port' "$CONFIG_FILE" > "$TEMP_CONFIG"
         
         # 启动v2ray
-        ./v2ray -config "$CONFIG_FILE" > /dev/null 2>&1 &
+        ./v2ray -config "$TEMP_CONFIG" > /dev/null 2>&1 &
         PID=$!
         sleep 3
         
-        # 测试函数
+        # 测试延迟函数
         test_latency() {
           local max_retry=2
           local total_ms=0
@@ -146,6 +184,7 @@ jobs:
           fi
         }
         
+        # 测试速度函数
         test_speed() {
           local max_time=15
           local url="https://speed.cloudflare.com/__down?bytes=10000000"
@@ -165,25 +204,28 @@ jobs:
           fi
         }
         
+        # 获取代理信息
+        protocol=$(jq -r '.outbounds[0].protocol' "$TEMP_CONFIG")
+        address=$(jq -r '.outbounds[0].settings.servers[0].address // .outbounds[0].settings.vnext[0].address' "$TEMP_CONFIG")
+        port=$(jq -r '.outbounds[0].settings.servers[0].port // .outbounds[0].settings.vnext[0].port' "$TEMP_CONFIG")
+        
         # 执行测试
         if latency=$(test_latency); then
           if speed=$(test_speed); then
-            # 获取代理信息
-            protocol=$(jq -r '.outbounds[0].protocol' "$CONFIG_FILE")
-            address=$(jq -r '.outbounds[0].settings.servers[0].address // .outbounds[0].settings.vnext[0].address' "$CONFIG_FILE")
-            port=$(jq -r '.outbounds[0].settings.servers[0].port // .outbounds[0].settings.vnext[0].port' "$CONFIG_FILE")
-            
-            # 输出结果
+            # 输出成功结果
             echo -e "Proxy: ${protocol}://${address}:${port}" >> "$RESULTS_FILE"
             echo -e "Latency: ${latency}ms\tSpeed: ${speed} Mbps" >> "$RESULTS_FILE"
             echo -e "Status: Working ✔️" >> "$RESULTS_FILE"
             echo "------------------------" >> "$RESULTS_FILE"
+            kill $PID
+            rm "$TEMP_CONFIG"
             exit 0
           fi
         fi
         
         # 测试失败
         kill $PID 2>/dev/null
+        rm "$TEMP_CONFIG"
         exit 1
         EOF
         
@@ -196,14 +238,24 @@ jobs:
           echo "{\"outbounds\": [$proxy]}" > "proxy-configs/$id.json"
         done
         
-        # 并发测试控制（最多5个并行）
+        # 并发测试控制（最多3个并行）
         echo "测试结果：" > results.txt
-        find proxy-configs -name '*.json' | xargs -P5 -I{} bash -c '
-          ./test-proxy.sh "{}" results.txt && rm "{}" || {
-            echo "Failed: {}" >&2
+        echo "开始时间: $(date)" >> results.txt
+        echo "=========================" >> results.txt
+        
+        find proxy-configs -name '*.json' -print0 | xargs -0 -P3 -I{} bash -c '
+          if ./test-proxy.sh "{}" results.txt; then
+            echo "测试成功: {}" >&2
             rm "{}"
-          }
+          else
+            echo "测试失败: {}" >&2
+            rm "{}"
+          fi
         '
+        
+        echo "=========================" >> results.txt
+        echo "结束时间: $(date)" >> results.txt
+        echo "测试完成" >> results.txt
 
     - name: Save results
       uses: actions/upload-artifact@v4
