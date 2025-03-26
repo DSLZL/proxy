@@ -1,0 +1,101 @@
+name: Proxy Speed Tester
+
+on:
+  schedule:
+    - cron: '0 22 * * *'  # UTC 22:00 (北京时间 6:00)
+  workflow_dispatch:
+
+env:
+  PROXY_FILE: "output/extracted_proxies.txt"  # 存放已解码代理配置的文件路径
+  TEST_URL: "http://www.gstatic.com/generate_204"
+  TIMEOUT: 5  # 单次测试超时(秒)
+
+jobs:
+  test-proxies:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install tools
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y jq curl netcat-openbsd
+
+    - name: Test proxies from file
+      run: |
+        mkdir -p output
+        # 从文件读取代理配置
+        if [[ ! -f "$PROXY_FILE" ]]; then
+          echo "❌ 代理配置文件 $PROXY_FILE 不存在"
+          exit 1
+        fi
+        
+        TOTAL_PROXIES=$(wc -l < "$PROXY_FILE")
+        echo "从 $PROXY_FILE 读取到 $TOTAL_PROXIES 个代理配置"
+        
+        # 测试所有代理
+        VALID_PROXIES=()
+        FAILED_PROXIES=()
+        
+        while read -r LINK; do
+          echo -e "\n测试代理: ${LINK:0:60}..."
+          
+          # 解析配置
+          CONFIG=$(echo "${LINK:8}" | base64 -d 2>/dev/null | jq -c 2>/dev/null)
+          if [[ -z "$CONFIG" ]]; then
+            echo "❌ 无效的vmess配置"
+            FAILED_PROXIES+=("$LINK|INVALID_JSON")
+            continue
+          fi
+          
+          # 提取连接参数
+          SERVER=$(jq -r '.add' <<< "$CONFIG")
+          PORT=$(jq -r '.port' <<< "$CONFIG")
+          
+          # 测试TCP连通性
+          echo "测试TCP连接: $SERVER:$PORT"
+          if timeout $TIMEOUT nc -z -w $TIMEOUT "$SERVER" "$PORT"; then
+            # 测试HTTP延迟
+            START=$(date +%s%N)
+            if curl -s -m $TIMEOUT "$TEST_URL" >/dev/null; then
+              LATENCY=$((($(date +%s%N) - START)/1000000))
+              echo "✅ 可用 - 延迟 ${LATENCY}ms"
+              VALID_PROXIES+=("$LINK|${LATENCY}ms")
+            else
+              echo "❌ HTTP测试失败"
+              FAILED_PROXIES+=("$LINK|HTTP_FAIL")
+            fi
+          else
+            echo "❌ TCP连接失败"
+            FAILED_PROXIES+=("$LINK|TCP_FAIL")
+          fi
+          
+          # 避免触发速率限制
+          sleep 0.5
+        done < "$PROXY_FILE"
+        
+        # 保存结果
+        echo -e "\n测试完成:"
+        echo "有效代理: ${#VALID_PROXIES[@]} 个"
+        echo "失败代理: ${#FAILED_PROXIES[@]} 个"
+        
+        if [[ ${#VALID_PROXIES[@]} -gt 0 ]]; then
+          printf "%s\n" "${VALID_PROXIES[@]}" > output/valid.txt
+          # 按延迟排序
+          sort -t'|' -k2 -n output/valid.txt -o output/valid_sorted.txt
+        else
+          echo "empty" > output/valid.txt
+        fi
+        printf "%s\n" "${FAILED_PROXIES[@]}" > output/failed.txt
+
+    - name: Upload results
+      uses: actions/upload-artifact@v4
+      with:
+        name: proxy-results
+        path: |
+          output/valid.txt
+          output/valid_sorted.txt
+          output/failed.txt
