@@ -37,6 +37,6 @@ jobs:
       run: |
         git config --global user.name "DSLZL"
         git config --global user.email "q2891362919@163.com"
-        git add available_proxies.txt
+        git add proxies/available_proxies.txt
         git commit -m "自动更新可用代理列表 [$(date +'%Y-%m-%d %H:%M')]"
         git push
