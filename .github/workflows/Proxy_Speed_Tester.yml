@@ -1,264 +1,39 @@
-name: Proxy Tester
+name: Proxy Checker
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: '0 0 * * *'
+    - cron: '0 0 * * *'  # 每日UTC时间0点运行
+  workflow_dispatch:     # 允许手动触发
 
 jobs:
-  test-proxies:
+  check-proxies:
     runs-on: ubuntu-latest
+    timeout-minutes: 30  # 超时时间
+    
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
-
-    - name: Setup environment
+    - name: 安装依赖
       run: |
         sudo apt-get update
-        sudo apt-get install -y wget jq bc unzip python3 python3-pip
-        pip install speedtest-cli
+        sudo apt-get install -y shadowsocks-libev curl wget unzip
+        wget https://github.com/XTLS/Xray-core/releases/download/v1.8.4/Xray-linux-64.zip
+        unzip Xray-linux-64.zip
+        sudo mv xray /usr/local/bin/
+        sudo chmod +x /usr/local/bin/xray
+        sudo ln -sf /usr/local/bin/xray /usr/local/bin/xray
         
-        # 下载最新版 v2ray-core
-        wget https://github.com/v2fly/v2ray-core/releases/latest/download/v2ray-linux-64.zip
-        unzip v2ray-linux-64.zip
-        chmod +x v2ray
-
-    - name: Process subscription
+    - name: 检出代码
+      uses: actions/checkout@v4
+      
+    - name: 运行检测脚本
       run: |
-        # 订阅链接（替换为你的实际链接）
-        SUBSCRIPTION_URL="https:/raw.githubusercontent.com/aiboboxx/v2rayfree/main/v2"
+        python3 proxy_checker.py proxies/extracted_proxies.txt proxies/available_proxies.txt
+      env:
+        PYTHONWARNINGS: "default"  # 启用Python警告
         
-        # 获取订阅内容（自动处理base64和非base64情况）
-        SUB_CONTENT=$(curl -s "$SUBSCRIPTION_URL")
-        
-        # 尝试base64解码（如果失败则使用原始内容）
-        if DECODED=$(echo "$SUB_CONTENT" | base64 -d 2>/dev/null); then
-          echo "$DECODED" > subscription.txt
-        else
-          echo "$SUB_CONTENT" > subscription.txt
-        fi
-
-        # 创建空的v2ray配置
-        echo '{"outbounds": []}' > v2ray-config.json
-        
-        # 处理vmess链接（增强版）
-        grep -E '^vmess://' subscription.txt | while read -r line; do
-          vmess_encoded="${line#vmess://}"
-          # 添加必要的base64填充
-          padding=$((4 - (${#vmess_encoded} % 4)))
-          [ $padding -ne 4 ] && vmess_encoded="${vmess_encoded}====" | head -c $(( ${#vmess_encoded} + (4 - ${#vmess_encoded} % 4) ))
-          
-          if vmess_json=$(echo "$vmess_encoded" | base64 -d 2>/dev/null | sed 's/"port":"\([0-9]*\)[^"]*"/"port":"\1"/g'); then
-            # 处理非标准端口格式（如443?allowInsecure=0）
-            vmess_json=$(echo "$vmess_json" | jq 'if (.port | type) == "string" then .port |= (split("?")[0] | tonumber) else . end' 2>/dev/null || echo "$vmess_json")
-            
-            # 使用临时文件处理JSON
-            echo "$vmess_json" > vmess-temp.json
-            if jq -e . vmess-temp.json >/dev/null 2>&1; then
-              jq --slurpfile vmess vmess-temp.json '
-                .outbounds += [{
-                  "protocol": "vmess",
-                  "settings": {"vnext": [$vmess[0]]},
-                  "streamSettings": $vmess[0].streamSettings
-                }]' v2ray-config.json > tmp.json && mv tmp.json v2ray-config.json
-            fi
-          fi
-        done
-        
-        # 处理ss链接（增强版）
-        grep -E '^ss://' subscription.txt | while read -r line; do
-          ss_encoded="${line#ss://}"
-          ss_encoded="${ss_encoded%%#*}"
-          
-          # 添加必要的base64填充
-          padding=$((4 - (${#ss_encoded} % 4)))
-          [ $padding -ne 4 ] && ss_encoded="${ss_encoded}====" | head -c $(( ${#ss_encoded} + (4 - ${#ss_encoded} % 4) ))
-          
-          if ss_decoded=$(echo "$ss_encoded" | base64 -d 2>/dev/null); then
-            method=$(echo "$ss_decoded" | cut -d':' -f1)
-            password_hostport=$(echo "$ss_decoded" | cut -d':' -f2-)
-            password=$(echo "$password_hostport" | cut -d'@' -f1)
-            hostport=$(echo "$password_hostport" | cut -d'@' -f2)
-            host=$(echo "$hostport" | cut -d':' -f1)
-            port=$(echo "$hostport" | cut -d':' -f2 | sed 's/[^0-9].*//')
-            
-            jq --arg host "$host" --arg port "$port" --arg method "$method" --arg password "$password" '
-              .outbounds += [{
-                "protocol": "shadowsocks",
-                "settings": {
-                  "servers": [{
-                    "address": $host,
-                    "port": ($port | tonumber),
-                    "method": $method,
-                    "password": $password
-                  }]
-                }
-              }]' v2ray-config.json > tmp.json && mv tmp.json v2ray-config.json
-          fi
-        done
-        
-        # 处理trojan链接（增强版）
-        grep -E '^trojan://' subscription.txt | while read -r line; do
-          trojan_config="${line#trojan://}"
-          password=$(echo "$trojan_config" | cut -d'@' -f1)
-          hostport=$(echo "$trojan_config" | cut -d'@' -f2 | cut -d'#' -f1)
-          host=$(echo "$hostport" | cut -d':' -f1)
-          port=$(echo "$hostport" | cut -d':' -f2 | sed 's/[^0-9].*//')
-          
-          jq --arg host "$host" --arg port "$port" --arg password "$password" '
-            .outbounds += [{
-              "protocol": "trojan",
-              "settings": {
-                "servers": [{
-                  "address": $host,
-                  "port": ($port | tonumber),
-                  "password": $password
-                }]
-              }
-            }]' v2ray-config.json > tmp.json && mv tmp.json v2ray-config.json
-        done
-        
-        # 处理原始JSON配置
-        if jq empty subscription.txt 2>/dev/null; then
-          # 修复JSON中可能存在的非标准端口格式
-          sed -i 's/"port":[ ]*"\([0-9]*\)[^"]*"/"port": \1/g' subscription.txt
-          jq '.outbounds' subscription.txt > outbounds.json
-          jq --slurpfile ob outbounds.json '.outbounds = $ob[0]' v2ray-config.json > tmp.json && mv tmp.json v2ray-config.json
-        fi
-        
-        # 验证最终配置
-        if ! jq empty v2ray-config.json 2>/dev/null; then
-          echo "生成的配置文件无效，请检查订阅格式"
-          exit 1
-        fi
-
-    - name: Test proxies
+    - name: 提交变更
       run: |
-        # 创建改进版测试脚本
-        cat << 'EOF' > test-proxy.sh
-        #!/bin/bash
-        
-        CONFIG_FILE="$1"
-        RESULTS_FILE="$2"
-        
-        # 生成随机本地端口
-        LOCAL_PORT=$((10800 + RANDOM % 1000))
-        
-        # 创建临时配置文件（处理非标准端口）
-        TEMP_CONFIG="/tmp/v2ray-config-$(date +%s).json"
-        jq --argjson port "$LOCAL_PORT" '
-          (.. | .port? | select(. != null)) |= $port |
-          (.. | .servers[].port? | select(. != null)) |= (if type == "string" then (split("?")[0] | tonumber) else . end) |
-          (.. | .vnext[].port? | select(. != null)) |= (if type == "string" then (split("?")[0] | tonumber) else . end)
-        ' "$CONFIG_FILE" > "$TEMP_CONFIG"
-        
-        # 启动v2ray
-        ./v2ray -config "$TEMP_CONFIG" > /dev/null 2>&1 &
-        PID=$!
-        sleep 3
-        
-        # 测试函数
-        test_connection() {
-          local max_retry=2
-          local timeout=5
-          local success=0
-          local total_time=0
-          
-          for ((i=1; i<=$max_retry; i++)); do
-            start=$(date +%s%N)
-            if code=$(curl -s -x socks5://127.0.0.1:$LOCAL_PORT -o /dev/null -w "%{http_code}" \
-               https://www.gstatic.com/generate_204 -m $timeout); then
-              if [ "$code" == "204" ]; then
-                end=$(date +%s%N)
-                total_time=$((total_time + (end - start)/1000000))
-                success=$((success + 1))
-              fi
-            fi
-          done
-          
-          if [ $success -gt 0 ]; then
-            echo $((total_time / success))
-            return 0
-          else
-            echo 9999
-            return 1
-          fi
-        }
-        
-        test_speed() {
-          local timeout=15
-          local url="https://speed.cloudflare.com/__down?bytes=10000000"
-          
-          start=$(date +%s%N)
-          downloaded=$(curl -s -x socks5://127.0.0.1:$LOCAL_PORT -o /dev/null -w "%{size_download}" \
-                    "$url" -m $timeout)
-          end=$(date +%s%N)
-          
-          if [ "$downloaded" -gt 0 ]; then
-            duration=$(echo "scale=3; ($end - $start)/1000000000" | bc)
-            echo $(echo "scale=2; ($downloaded*8)/($duration*1000000)" | bc)
-            return 0
-          else
-            echo 0
-            return 1
-          fi
-        }
-        
-        # 获取代理信息
-        protocol=$(jq -r '.outbounds[0].protocol' "$TEMP_CONFIG")
-        address=$(jq -r '.outbounds[0].settings.servers[0].address // .outbounds[0].settings.vnext[0].address' "$TEMP_CONFIG")
-        port=$(jq -r '.outbounds[0].settings.servers[0].port // .outbounds[0].settings.vnext[0].port' "$TEMP_CONFIG")
-        
-        # 执行测试
-        if latency=$(test_connection); then
-          if speed=$(test_speed); then
-            # 输出成功结果
-            echo -e "Proxy: ${protocol}://${address}:${port}" >> "$RESULTS_FILE"
-            echo -e "Latency: ${latency}ms\tSpeed: ${speed} Mbps" >> "$RESULTS_FILE"
-            echo -e "Status: Working ✔️" >> "$RESULTS_FILE"
-            echo "------------------------" >> "$RESULTS_FILE"
-            kill $PID
-            rm "$TEMP_CONFIG"
-            exit 0
-          fi
-        fi
-        
-        # 测试失败
-        kill $PID 2>/dev/null
-        rm "$TEMP_CONFIG"
-        exit 1
-        EOF
-        
-        chmod +x test-proxy.sh
-        
-        # 准备测试
-        mkdir -p proxy-configs
-        jq -c '.outbounds[]' v2ray-config.json | while read -r proxy; do
-          id=$(uuidgen | cut -d'-' -f1)
-          echo "{\"outbounds\": [$proxy]}" > "proxy-configs/$id.json"
-        done
-        
-        # 并发测试控制
-        echo "测试结果：" > results.txt
-        echo "开始时间: $(date)" >> results.txt
-        echo "=========================" >> results.txt
-        
-        find proxy-configs -name '*.json' -print0 | xargs -0 -P3 -I{} bash -c '
-          if ./test-proxy.sh "{}" results.txt; then
-            echo "测试成功: {}" >&2
-            rm "{}"
-          else
-            echo "测试失败: {}" >&2
-            rm "{}"
-          fi
-        '
-        
-        echo "=========================" >> results.txt
-        echo "结束时间: $(date)" >> results.txt
-        echo "有效代理数量: $(grep -c "Status: Working ✔️" results.txt)" >> results.txt
-
-    - name: Save results
-      uses: actions/upload-artifact@v4
-      with:
-        name: proxy-results
-        path: results.txt
+        git config --global user.name "DSLZL"
+        git config --global user.email "q2891362919@163.com"
+        git add available_proxies.txt
+        git commit -m "自动更新可用代理列表"
+        git push
