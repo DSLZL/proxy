@@ -35,10 +35,10 @@ jobs:
         import requests
         from v2ray_client import V2RayClient
         
-        INPUT_FILE = os.getenv('INPUT_FILE', 'proxies.txt')
-        OUTPUT_FILE = os.getenv('OUTPUT_FILE', 'working_proxies.txt')
-        TEST_URL = os.getenv('TEST_URL', 'https://www.google.com')
-        TIMEOUT = int(os.getenv('TIMEOUT', '10'))
+        INPUT_FILE = os.getenv('INPUT_FILE', 'proxies/extracted_proxies.txt')
+        OUTPUT_FILE = os.getenv('OUTPUT_FILE', 'proxies/working_proxies.txt')
+        TEST_URL = os.getenv('TEST_URL', 'http://www.gstatic.com/generate_204')
+        TIMEOUT = int(os.getenv('TIMEOUT', '30'))
         
         def parse_proxy_link(link):
             """解析各种V2Ray代理链接并返回标准配置"""
