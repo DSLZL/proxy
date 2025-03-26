@@ -12,10 +12,14 @@ env:
 jobs:
   extract-proxies:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write  # 添加写入权限
     
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
+      with:
+        persist-credentials: true
       
     - name: Setup environment
       run: |
@@ -86,13 +90,15 @@ jobs:
           echo "${line:0:60}..."
         done
         
-        # 移动结果文件
-        mv "$OUTPUT_FILE" "output/$OUTPUT_FILE"
+        # 移动结果文件到仓库目录
+        mkdir -p proxies
+        mv "$OUTPUT_FILE" "proxies/$OUTPUT_FILE"
+        mv decoded.txt "proxies/decoded.txt"
         
-    - name: Upload results
-      uses: actions/upload-artifact@v4
-      with:
-        name: v2ray-proxies
-        path: |
-          output/${{ env.OUTPUT_FILE }}
-          decoded.txt
+    - name: Commit and push changes
+      run: |
+        git config --global user.name "DSLZL"
+        git config --global user.email "q2891362919@163.com"
+        git add proxies/
+        git commit -m "Auto-update proxy list [skip ci]"
+        git push
