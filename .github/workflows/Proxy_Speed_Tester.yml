@@ -42,23 +42,38 @@ jobs:
         
         while read -r LINK; do
           echo -e "\n测试代理: ${LINK:0:60}..."
-          
-          # 解析配置
-          CONFIG=$(echo "${LINK:8}" | base64 -d 2>/dev/null | jq -c 2>/dev/null)
-          if [[ -z "$CONFIG" ]]; then
-            echo "❌ 无效的vmess配置"
-            FAILED_PROXIES+=("$LINK|INVALID_JSON")
+  
+          # 协议检测
+          if [[ "$LINK" == vmess://* ]]; then
+            # Vmess协议处理
+            CONFIG=$(echo "${LINK:8}" | base64 -d 2>/dev/null | jq -c 2>/dev/null)
+            if [[ -z "$CONFIG" ]]; then
+              echo "❌ 无效的vmess配置"
+              FAILED_PROXIES+=("$LINK|INVALID_VMESS")
+              continue
+            fi
+            SERVER=$(jq -r '.add' <<< "$CONFIG")
+            PORT=$(jq -r '.port' <<< "$CONFIG")
+  
+          elif [[ "$LINK" == ss://* ]]; then
+            # Shadowsocks协议处理
+            DECODED=$(echo "${LINK:5}" | base64 -d 2>/dev/null)
+            if [[ -z "$DECODED" ]]; then
+              echo "❌ 无效的ss配置"
+              FAILED_PROXIES+=("$LINK|INVALID_SS")
+              continue
+            fi
+            IFS='@:' read -r _ SERVER PORT <<< "$DECODED"
+  
+          else
+            echo "❌ 不支持的协议: ${LINK%%://*}"
+            FAILED_PROXIES+=("$LINK|UNSUPPORTED_PROTOCOL")
             continue
           fi
-          
-          # 提取连接参数
-          SERVER=$(jq -r '.add' <<< "$CONFIG")
-          PORT=$(jq -r '.port' <<< "$CONFIG")
-          
-          # 测试TCP连通性
-          echo "测试TCP连接: $SERVER:$PORT"
+  
+          # 通用测试逻辑
+          echo "测试连接: $SERVER:$PORT"
           if timeout $TIMEOUT nc -z -w $TIMEOUT "$SERVER" "$PORT"; then
-            # 测试HTTP延迟
             START=$(date +%s%N)
             if curl -s -m $TIMEOUT "$TEST_URL" >/dev/null; then
               LATENCY=$((($(date +%s%N) - START)/1000000))
@@ -72,8 +87,7 @@ jobs:
             echo "❌ TCP连接失败"
             FAILED_PROXIES+=("$LINK|TCP_FAIL")
           fi
-          
-          # 避免触发速率限制
+  
           sleep 0.5
         done < "$PROXY_FILE"
         
