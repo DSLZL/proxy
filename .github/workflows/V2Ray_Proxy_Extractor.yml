@@ -1,0 +1,98 @@
+name: V2Ray Proxy Extractor
+
+on:
+  workflow_dispatch:  # Allow manual trigger
+  schedule:
+    - cron: '0 6 * * *'  # Runs daily at 6 AM UTC
+
+env:
+  SUBSCRIPTION_URL: "https://raw.githubusercontent.com/aiboboxx/v2rayfree/main/v2"
+  OUTPUT_FILE: "extracted_proxies.txt"
+
+jobs:
+  extract-proxies:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup environment
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y jq curl
+        
+    - name: Extract proxy links
+      run: |
+        mkdir -p output
+        
+        # 下载订阅内容
+        echo "正在下载订阅内容..."
+        curl -s "$SUBSCRIPTION_URL" -o subscription.raw
+        echo "下载完成，文件大小: $(wc -c < subscription.raw) 字节"
+        
+        # 解码内容
+        echo -e "\n正在解码订阅内容..."
+        base64 -d subscription.raw > decoded.txt 2>/dev/null || {
+          echo "Base64解码失败，使用原始内容"
+          cp subscription.raw decoded.txt
+        }
+        
+        # 提取所有支持的协议链接
+        echo -e "\n正在提取代理链接..."
+        PROTOCOL_PATTERNS=(
+          'vmess://[^"<> ]*'
+          'vless://[^"<> ]*'
+          'ss://[^"<> ]*'
+          'ssr://[^"<> ]*'
+          'trojan://[^"<> ]*'
+        )
+        
+        > "$OUTPUT_FILE"  # 清空输出文件
+        
+        for pattern in "${PROTOCOL_PATTERNS[@]}"; do
+          echo "正在提取 $pattern 链接..."
+          grep -oE "$pattern" decoded.txt | sort -u >> "$OUTPUT_FILE"
+        done
+        
+        # 处理多重编码的SSR链接
+        if grep -q 'ssr://[A-Za-z0-9_-]\+' "$OUTPUT_FILE"; then
+          echo -e "\n检测到多重编码的SSR链接，正在进一步解码..."
+          while read -r line; do
+            if [[ "$line" =~ ^ssr://([A-Za-z0-9_-]+)$ ]]; then
+              decoded=$(echo "${BASH_REMATCH[1]}" | base64 -d 2>/dev/null)
+              if [ -n "$decoded" ]; then
+                echo "ssr://$decoded" >> "$OUTPUT_FILE.tmp"
+              else
+                echo "$line" >> "$OUTPUT_FILE.tmp"
+              fi
+            else
+              echo "$line" >> "$OUTPUT_FILE.tmp"
+            fi
+          done < "$OUTPUT_FILE"
+          mv "$OUTPUT_FILE.tmp" "$OUTPUT_FILE"
+        fi
+        
+        # 去重并统计
+        sort -u "$OUTPUT_FILE" -o "$OUTPUT_FILE"
+        TOTAL_COUNT=$(wc -l < "$OUTPUT_FILE")
+        
+        echo -e "\n代理提取完成"
+        echo "各协议数量统计:"
+        grep -oE '^[^:]+' "$OUTPUT_FILE" | sort | uniq -c | sort -nr
+        echo -e "\n总共提取代理数量: $TOTAL_COUNT"
+        echo -e "\n示例代理(前5个):"
+        head -n 5 "$OUTPUT_FILE" | while read -r line; do
+          echo "${line:0:60}..."
+        done
+        
+        # 移动结果文件
+        mv "$OUTPUT_FILE" "output/$OUTPUT_FILE"
+        
+    - name: Upload results
+      uses: actions/upload-artifact@v4
+      with:
+        name: v2ray-proxies
+        path: |
+          output/${{ env.OUTPUT_FILE }}
+          decoded.txt
