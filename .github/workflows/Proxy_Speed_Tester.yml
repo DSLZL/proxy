@@ -26,7 +26,7 @@ jobs:
     - name: Get and decode proxy subscription
       run: |
         # 订阅链接（直接明文存储）
-        SUBSCRIPTION_URL=https:/raw.githubusercontent.com/aiboboxx/v2rayfree/main/v2
+        SUBSCRIPTION_URL="https:/raw.githubusercontent.com/aiboboxx/v2rayfree/main/v2"
         
         # 获取订阅内容并解码
         curl -s "$SUBSCRIPTION_URL" | base64 --decode > subscription.txt
