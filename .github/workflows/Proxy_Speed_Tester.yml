@@ -1,263 +1,131 @@
-name: V2Ray Proxy Tester
+name: Proxy Tester
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 0 * * *'  # 每天运行一次
+    - cron: '0 0 * * *' # 每天运行一次
 
 jobs:
   test-proxies:
     runs-on: ubuntu-latest
-    
     steps:
-    - name: Checkout repository
+    - name: Checkout
       uses: actions/checkout@v4
-      
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.10'
-        
-    - name: Install dependencies
+
+    - name: Setup environment
       run: |
-        python -m pip install --upgrade pip
-        pip install requests urllib3
+        sudo apt-get update
+        sudo apt-get install -y wget jq bc
         
-    - name: Install V2Ray Core
+        # 下载 v2ray-core
+        V2RAY_VERSION=$(curl -s https://api.github.com/repos/v2fly/v2ray-core/releases/latest | jq -r '.tag_name')
+        wget https://github.com/v2fly/v2ray-core/releases/download/${V2RAY_VERSION}/v2ray-linux-64.zip
+        unzip v2ray-linux-64.zip
+        chmod +x v2ray
+
+    - name: Get and decode proxy subscription
       run: |
-        sudo bash -c 'bash <(curl -L https://raw.githubusercontent.com/v2fly/fhs-install-v2ray/master/install-release.sh)'
-        sudo systemctl stop v2ray  # 不需要保持服务运行
+        # 订阅链接（直接明文存储）
+        SUBSCRIPTION_URL=https:/raw.githubusercontent.com/aiboboxx/v2rayfree/main/v2
         
+        # 获取订阅内容并解码
+        curl -s "$SUBSCRIPTION_URL" | base64 --decode > subscription.txt
+        
+        # 解析混合格式订阅（vmess://, ss://, trojan://等）
+        echo '{"outbounds": []}' > v2ray-config.json
+        
+        # 处理vmess链接
+        grep -E '^vmess://' subscription.txt | while read line; do
+          vmess_content=$(echo "$line" | cut -d'/' -f3 | base64 --decode)
+          jq --argjson vmess "$vmess_content" '.outbounds += [{
+            "protocol": "vmess",
+            "settings": {"vnext": [$vmess]},
+            "streamSettings": $vmess.streamSettings
+          }]' v2ray-config.json > tmp.json && mv tmp.json v2ray-config.json
+        done
+        
+        # 处理ss链接（简化处理）
+        grep -E '^ss://' subscription.txt | while read line; do
+          ss_content=$(echo "$line" | cut -d'/' -f3)
+          jq --arg ss "$ss_content" '.outbounds += [{
+            "protocol": "shadowsocks",
+            "settings": {"servers": [{"address": "example.com", "port": 1234, "method": "aes-256-gcm", "password": "password"}]}
+          }]' v2ray-config.json > tmp.json && mv tmp.json v2ray-config.json
+        done
+        
+        # 处理trojan链接（简化处理）
+        grep -E '^trojan://' subscription.txt | while read line; do
+          trojan_content=$(echo "$line" | cut -d'/' -f3)
+          jq --arg trojan "$trojan_content" '.outbounds += [{
+            "protocol": "trojan",
+            "settings": {"servers": [{"address": "example.com", "port": 443, "password": "password"}]}
+          }]' v2ray-config.json > tmp.json && mv tmp.json v2ray-config.json
+        done
+
     - name: Test proxies
       run: |
         # 创建测试脚本
-        cat << 'EOF' > test_proxies.py
-        import json
-        import os
-        import time
-        import subprocess
-        from urllib.parse import urlparse, parse_qs, unquote
-        import requests
+        cat << 'EOF' > test-proxy.sh
+        #!/bin/bash
         
-        INPUT_FILE = os.getenv('INPUT_FILE', 'proxies/extracted_proxies.txt')
-        OUTPUT_FILE = os.getenv('OUTPUT_FILE', 'proxies/working_proxies.txt')
-        TEST_URL = os.getenv('TEST_URL', 'http://www.gstatic.com/generate_204')
-        TIMEOUT = int(os.getenv('TIMEOUT', '30'))
-        V2RAY_BIN = '/usr/local/bin/v2ray'
+        CONFIG_FILE="$1"
+        RESULTS_FILE="$2"
         
-        def generate_config(proxy_config):
-            """生成V2Ray临时配置文件"""
-            config = {
-                "inbounds": [{
-                    "port": 1080,
-                    "listen": "127.0.0.1",
-                    "protocol": "socks",
-                    "settings": {
-                        "auth": "noauth",
-                        "udp": True
-                    }
-                }],
-                "outbounds": [{
-                    "protocol": proxy_config["protocol"],
-                    "settings": proxy_config.get("settings", {}),
-                    "streamSettings": proxy_config.get("streamSettings", {})
-                }]
-            }
-            
-            # 特殊协议处理
-            if proxy_config["protocol"] == "vmess":
-                config["outbounds"][0]["settings"] = {
-                    "vnext": [{
-                        "address": proxy_config["address"],
-                        "port": proxy_config["port"],
-                        "users": [{
-                            "id": proxy_config["uuid"],
-                            "alterId": proxy_config.get("alterId", 0),
-                            "security": proxy_config.get("security", "auto")
-                        }]
-                    }]
-                }
-                
-                # 传输设置
-                config["outbounds"][0]["streamSettings"] = {
-                    "network": proxy_config.get("network", "tcp"),
-                    "security": proxy_config.get("tls", "none"),
-                    "wsSettings": {
-                        "path": proxy_config.get("path", ""),
-                        "headers": {
-                            "Host": proxy_config.get("host", "")
-                        }
-                    } if proxy_config.get("network") == "ws" else None
-                }
-            
-            elif proxy_config["protocol"] == "vless":
-                config["outbounds"][0]["settings"] = {
-                    "vnext": [{
-                        "address": proxy_config["address"],
-                        "port": proxy_config["port"],
-                        "users": [{
-                            "id": proxy_config["uuid"],
-                            "flow": proxy_config.get("flow", ""),
-                            "encryption": proxy_config.get("encryption", "none")
-                        }]
-                    }]
-                }
-                
-                config["outbounds"][0]["streamSettings"] = {
-                    "network": proxy_config.get("network", "tcp"),
-                    "security": proxy_config.get("security", "none"),
-                    "wsSettings": {
-                        "path": proxy_config.get("path", ""),
-                        "headers": {
-                            "Host": proxy_config.get("host", "")
-                        }
-                    } if proxy_config.get("network") == "ws" else None,
-                    "grpcSettings": {
-                        "serviceName": proxy_config.get("serviceName", "")
-                    } if proxy_config.get("network") == "grpc" else None
-                }
-            
-            return config
+        # 启动v2ray
+        ./v2ray -config "$CONFIG_FILE" > /dev/null 2>&1 &
+        PID=$!
+        sleep 5
         
-        def test_proxy(proxy_config):
-            """测试单个代理"""
-            try:
-                # 生成临时配置文件
-                config = generate_config(proxy_config)
-                config_file = "temp_config.json"
-                with open(config_file, 'w') as f:
-                    json.dump(config, f)
-                
-                # 启动V2Ray进程
-                process = subprocess.Popen(
-                    [V2RAY_BIN, "-config", config_file],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE
-                )
-                
-                # 等待进程启动
-                time.sleep(2)
-                
-                # 测试连接
-                proxies = {
-                    'http': 'socks5://127.0.0.1:1080',
-                    'https': 'socks5://127.0.0.1:1080'
-                }
-                
-                start_time = time.time()
-                response = requests.get(
-                    TEST_URL,
-                    proxies=proxies,
-                    timeout=TIMEOUT
-                )
-                latency = (time.time() - start_time) * 1000  # ms
-                
-                # 停止V2Ray进程
-                process.terminate()
-                process.wait()
-                
-                if response.status_code == 200:
-                    return True, latency
-            except Exception:
-                if 'process' in locals():
-                    process.terminate()
-            return False, 0
+        # 测试延迟（使用https://www.gstatic.com/generate_204）
+        START_TIME=$(date +%s%N)
+        RESPONSE=$(curl -s -x socks5://127.0.0.1:1080 -o /dev/null -w "%{http_code}" https://www.gstatic.com/generate_204 -m 10)
+        END_TIME=$(date +%s%N)
         
-        def parse_proxy_link(link):
-            """解析代理链接为配置对象"""
-            try:
-                parsed = urlparse(link)
-                protocol = parsed.scheme.lower()
-                config = {"protocol": protocol}
-                
-                # 通用参数
-                if parsed.username:
-                    config["uuid"] = parsed.username
-                if parsed.password:
-                    config["password"] = parsed.password
-                
-                config["address"] = parsed.hostname
-                config["port"] = parsed.port or (443 if protocol.endswith('s') else 80)
-                
-                # 解析查询参数
-                query = parse_qs(parsed.query)
-                
-                # 协议特定处理
-                if protocol == "vmess":
-                    config.update({
-                        "alterId": int(query.get("aid", ["0"])[0]),
-                        "security": query.get("scy", ["auto"])[0],
-                        "network": query.get("type", ["tcp"])[0],
-                        "path": unquote(query.get("path", [""])[0]),
-                        "host": unquote(query.get("host", [""])[0]),
-                        "tls": query.get("tls", ["none"])[0]
-                    })
-                elif protocol == "vless":
-                    config.update({
-                        "flow": query.get("flow", [""])[0],
-                        "encryption": query.get("encryption", ["none"])[0],
-                        "network": query.get("type", ["tcp"])[0],
-                        "security": query.get("security", ["none"])[0],
-                        "path": unquote(query.get("path", [""])[0]),
-                        "host": unquote(query.get("host", [""])[0]),
-                        "serviceName": unquote(query.get("serviceName", [""])[0])
-                    })
-                elif protocol in ["trojan", "trojan-go"]:
-                    config.update({
-                        "password": parsed.username,
-                        "flow": query.get("flow", [""])[0],
-                        "security": query.get("security", ["tls"])[0],
-                        "network": query.get("type", ["tcp"])[0],
-                        "path": unquote(query.get("path", [""])[0]),
-                        "host": unquote(query.get("host", [""])[0]),
-                        "sni": query.get("sni", [""])[0]
-                    })
-                
-                return config
-            except Exception as e:
-                print(f"Error parsing {link}: {str(e)}")
-                return None
+        if [ "$RESPONSE" == "204" ]; then
+          LATENCY_MS=$((($END_TIME - $START_TIME)/1000000))
+          
+          # 测试速度（使用https://speed.cloudflare.com/__down?bytes=10000000）
+          START_TIME=$(date +%s%N)
+          DOWNLOADED_BYTES=$(curl -s -x socks5://127.0.0.1:1080 -o /dev/null -w "%{size_download}" https://speed.cloudflare.com/__down?bytes=10000000 -m 30)
+          END_TIME=$(date +%s%N)
+          
+          if [ "$DOWNLOADED_BYTES" -gt 0 ]; then
+            DURATION_S=$(echo "scale=3; ($END_TIME - $START_TIME)/1000000000" | bc)
+            SPEED_MBPS=$(echo "scale=2; ($DOWNLOADED_BYTES*8)/($DURATION_S*1000000)" | bc)
+            
+            # 输出结果
+            echo "Proxy: $(jq -r '.outbounds[0].protocol' $CONFIG_FILE)" >> "$RESULTS_FILE"
+            echo "Address: $(jq -r '.outbounds[0].settings.servers[0].address // .outbounds[0].settings.vnext[0].address' $CONFIG_FILE)" >> "$RESULTS_FILE"
+            echo "Port: $(jq -r '.outbounds[0].settings.servers[0].port // .outbounds[0].settings.vnext[0].port' $CONFIG_FILE)" >> "$RESULTS_FILE"
+            echo "Latency: ${LATENCY_MS}ms" >> "$RESULTS_FILE"
+            echo "Speed: ${SPEED_MBPS} Mbps" >> "$RESULTS_FILE"
+            echo "------------------------" >> "$RESULTS_FILE"
+          fi
+        fi
         
-        def main():
-            with open(INPUT_FILE, 'r') as f:
-                links = [line.strip() for line in f if line.strip()]
-            
-            working_proxies = []
-            
-            for link in links:
-                try:
-                    proxy_config = parse_proxy_link(link)
-                    if proxy_config:
-                        is_working, latency = test_proxy(proxy_config)
-                        if is_working:
-                            print(f"✓ Working proxy: {link} (Latency: {latency:.2f}ms)")
-                            working_proxies.append((link, latency))
-                        else:
-                            print(f"✗ Failed proxy: {link}")
-                except Exception as e:
-                    print(f"Error processing {link}: {str(e)}")
-            
-            # 按延迟排序
-            working_proxies.sort(key=lambda x: x[1])
-            
-            with open(OUTPUT_FILE, 'w') as f:
-                for link, latency in working_proxies:
-                    f.write(f"{link}\n")
-            
-            print(f"\nResults: {len(working_proxies)} working out of {len(links)}")
-            print(f"Fastest proxy latency: {working_proxies[0][1]:.2f}ms" if working_proxies else "No working proxies found")
-        
-        if __name__ == '__main__':
-            main()
+        kill $PID
         EOF
         
-        # 运行测试脚本
-        python test_proxies.py
+        chmod +x test-proxy.sh
         
-    - name: Commit results
-      run: |
-        git config --global user.name "GitHub Actions"
-        git config --global user.email "actions@github.com"
-        git add working_proxies.txt
-        git diff --quiet && git diff --staged --quiet || git commit -m "Update working proxies [skip ci]"
-        git push
+        # 为每个代理创建单独配置并测试
+        mkdir -p proxy-configs
+        TOTAL_PROXIES=$(jq '.outbounds | length' v2ray-config.json)
+        
+        echo "开始测试 $TOTAL_PROXIES 个代理..."
+        echo "测试结果：" > results.txt
+        
+        for ((i=0; i<$TOTAL_PROXIES; i++)); do
+          CONFIG_FILE="proxy-configs/proxy-$i.json"
+          echo '{"outbounds": []}' > "$CONFIG_FILE"
+          jq --argjson idx "$i" '.outbounds += [.outbounds[$idx]]' v2ray-config.json > tmp.json && mv tmp.json "$CONFIG_FILE"
+          
+          echo "测试代理 $((i+1))/$TOTAL_PROXIES ..."
+          ./test-proxy.sh "$CONFIG_FILE" results.txt && rm "$CONFIG_FILE" || echo "代理 $((i+1)) 测试失败"
+        done
+
+    - name: Save results
+      uses: actions/upload-artifact@v3
+      with:
+        name: proxy-results
+        path: results.txt
