@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 env:
-  PROXY_FILE: "proxies/extracted_proxies.txt"  # 存放已解码代理配置的文件路径
+  PROXY_FILE: "proxies/extracted_proxies.txt"  # 修改为仓库内已有文件路径
   TEST_URL: "http://www.gstatic.com/generate_204"
   TIMEOUT: 5  # 单次测试超时(秒)
 
